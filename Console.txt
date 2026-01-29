@@ -1,0 +1,3 @@
+"C:\Program Files\Epic Games\UE_5.0\Engine\Build\BatchFiles\Build.bat" -projectfiles -2019 ^
+  -project="C:\Users\polin\Documents\Unreal Projects\wcw_OSIRIS_Dev\wcw_OSIRIS_Dev.uproject" ^
+  -game -rocket -progress

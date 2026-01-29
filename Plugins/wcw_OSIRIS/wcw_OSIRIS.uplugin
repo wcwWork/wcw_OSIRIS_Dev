@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "wcw_OSIRIS",
+	"Description": "wcw_OSIRIS is the core save system for Unreal Engine projects by Winter Corps Works. Its task is simple and strict: save and restore the game world reliably and the same way across platforms and engine versions, using an explicit “mark what matters” rule with serialization as the backbone. The world does not restart after loading it continues from the exact point where the player stopped, calm and predictable every day of development",
+	"Category": "Other",
+	"CreatedBy": "Nikita Petrachkov",
+	"CreatedByURL": "https://www.linkedin.com/in/nikita-petrachkov-968697108/",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "wcw_OSIRIS",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
