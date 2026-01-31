@@ -20,3 +20,24 @@ int32 UOsirisSubsystem::GetMarkedActorCount() const
 	}
 	return Count;
 }
+
+void UOsirisSubsystem::GetMarkedPlacedSpawnedCount(int32& OutPlaced, int32& OutSpawned) const
+{
+	OutPlaced = 0;
+	OutSpawned = 0;
+
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor) continue;
+
+		if (!Actor->FindComponentByClass<UOsirisSaveComponent>()) continue;
+
+		const bool bPlaced = Actor->HasAnyFlags(RF_WasLoaded);
+		if (bPlaced) ++OutPlaced;
+		else ++OutSpawned;
+	}
+}

@@ -3,32 +3,20 @@
 
 #include "OsirisSaveComponent.h"
 
-// Sets default values for this component's properties
-UOsirisSaveComponent::UOsirisSaveComponent()
-{
-	// Set this component to be initialized when the game starts, and to be ticked every frame.  You can turn these features
-	// off to improve performance if you don't need them.
-	PrimaryComponentTick.bCanEverTick = true;
 
-	// ...
+void UOsirisSaveComponent::OnRegister()
+{
+	Super::OnRegister();
+
+	if (!OsirisGuid.IsValid())
+	{
+		OsirisGuid = FGuid::NewGuid();
+	}
 }
 
-
-// Called when the game starts
-void UOsirisSaveComponent::BeginPlay()
+FString UOsirisSaveComponent::GetOsirisGuidString() const
 {
-	Super::BeginPlay();
-
-	// ...
-	
+	return OsirisGuid.IsValid()
+		? OsirisGuid.ToString(EGuidFormats::DigitsWithHyphens)
+		: TEXT("INVALID_GUID");
 }
-
-
-// Called every frame
-void UOsirisSaveComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
-{
-	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
-
-	// ...
-}
-

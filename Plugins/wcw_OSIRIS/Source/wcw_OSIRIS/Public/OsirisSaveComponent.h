@@ -1,4 +1,4 @@
-// Fill out your copyright notice in the Description page of Project Settings.
+﻿// Fill out your copyright notice in the Description page of Project Settings.
 
 #pragma once
 
@@ -12,17 +12,21 @@ class WCW_OSIRIS_API UOsirisSaveComponent : public UActorComponent
 {
 	GENERATED_BODY()
 
-public:	
-	// Sets default values for this component's properties
-	UOsirisSaveComponent();
+public:
+
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "OSIRIS")
+	FGuid OsirisGuid;
+
+	UFUNCTION(BlueprintCallable, Category = "OSIRIS")
+	FString GetOsirisGuidString() const;
+
+	void SetOsirisGuid(const FGuid& InGuid) { OsirisGuid = InGuid; }
 
 protected:
-	// Called when the game starts
-	virtual void BeginPlay() override;
 
-public:	
-	// Called every frame
-	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
+	//**After registration, a unique Guid is immediately created.*
+	//**登録後、一意の Guid がすぐに作成されます。*
+	virtual void OnRegister() override;
 
 		
 };
