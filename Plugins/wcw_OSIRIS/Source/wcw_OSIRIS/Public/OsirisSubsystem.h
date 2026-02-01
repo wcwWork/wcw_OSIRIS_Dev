@@ -10,14 +10,10 @@ class WCW_OSIRIS_API UOsirisSubsystem : public UGameInstanceSubsystem
 	GENERATED_BODY()
 
 public:
-
-	//**Method for checking how many objects in the game world the save component has.*
-	//**保存コンポーネントがゲーム ワールド内にいくつのオブジェクトを持っているかを確認するメソッド.*
+	
+	//**A method that displays complete information about the object to be saved, such as(GUID, whether it was spawned, class, and world position). *
+	//**保存するオブジェクトに関する完全な情報 (GUID、生成されたかどうか、クラス、ワールド位置など) を表示するメソッド。*
 	UFUNCTION(BlueprintCallable, Category = "OSIRIS")
-	int32 GetMarkedActorCount() const;
+	FString BuildDebugManifestString(int32 MaxLines = 50) const;
 
-	//**A method for checking whether an object was initially present on the level or was added later at runtime.*
-	//**オブジェクトがレベル上に最初から存在していたか、実行時に後で追加されたかを確認するメソッド。*
-	UFUNCTION(BlueprintCallable, Category = "OSIRIS")
-	void GetMarkedPlacedSpawnedCount(int32& OutPlaced, int32& OutSpawned) const;
 };

@@ -5,39 +5,43 @@
 #include "OsirisSaveComponent.h"
 #include "EngineUtils.h"
 
-int32 UOsirisSubsystem::GetMarkedActorCount() const
+
+FString UOsirisSubsystem::BuildDebugManifestString(int32 MaxLines) const
 {
 	UWorld* World = GetWorld();
-	if (!World) return 0;
+	if (!World) return TEXT("NO_WORLD");
 
-	int32 Count = 0;
-	for (TActorIterator<AActor> It(World); It; ++It)
-	{
-		if (It->FindComponentByClass<UOsirisSaveComponent>())
-		{
-			++Count;
-		}
-	}
-	return Count;
-}
-
-void UOsirisSubsystem::GetMarkedPlacedSpawnedCount(int32& OutPlaced, int32& OutSpawned) const
-{
-	OutPlaced = 0;
-	OutSpawned = 0;
-
-	UWorld* World = GetWorld();
-	if (!World) return;
+	FString Out;
+	int32 Lines = 0;
 
 	for (TActorIterator<AActor> It(World); It; ++It)
 	{
 		AActor* Actor = *It;
 		if (!Actor) continue;
 
-		if (!Actor->FindComponentByClass<UOsirisSaveComponent>()) continue;
+		UOsirisSaveComponent* SaveComp = Actor->FindComponentByClass<UOsirisSaveComponent>();
+		if (!SaveComp) continue;
 
 		const bool bPlaced = Actor->HasAnyFlags(RF_WasLoaded);
-		if (bPlaced) ++OutPlaced;
-		else ++OutSpawned;
+		const FVector Loc = Actor->GetActorLocation();
+
+		const FString GuidStr = SaveComp->GetOsirisGuidString();
+		const FString KindStr = bPlaced ? TEXT("PLACED") : TEXT("SPAWNED");
+		const FString ClassStr = Actor->GetClass() ? Actor->GetClass()->GetName() : TEXT("NOCLASS");
+
+		Out += FString::Printf(
+			TEXT("%s | %s | %s | Loc(%.0f,%.0f,%.0f)\n"),
+			*GuidStr, *KindStr, *ClassStr, Loc.X, Loc.Y, Loc.Z
+		);
+
+		++Lines;
+		if (Lines >= MaxLines) break;
 	}
+
+	if (Lines == 0)
+	{
+		return TEXT("NO_MARKED_ACTORS");
+	}
+
+	return Out;
 }
