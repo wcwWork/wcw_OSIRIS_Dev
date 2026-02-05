@@ -1,168 +1,184 @@
 #include "OsirisSubsystem.h"
 
 #include "OsirisSaveComponent.h"
-#include "Components/ActorComponent.h"
+#include "OsirisSaveGame.h"
+
 #include "EngineUtils.h"
+#include "Kismet/GameplayStatics.h"
+#include "GameFramework/Actor.h"
+#include "Components/ActorComponent.h"
 
 #include "Serialization/MemoryWriter.h"
 #include "Serialization/MemoryReader.h"
 #include "Serialization/ObjectAndNameAsStringProxyArchive.h"
 
+static const FString GOsirisSlot = TEXT("OSIRIS_SLOT");
 
-struct FOsirisSaveGameArchive : public FObjectAndNameAsStringProxyArchive
+struct FOsirisWorldAr : FObjectAndNameAsStringProxyArchive
 {
-	FOsirisSaveGameArchive(FArchive& Inner)
-		: FObjectAndNameAsStringProxyArchive(Inner, true)
-	{
-		ArIsSaveGame = true;
-		ArNoDelta = true;
-	}
+	FOsirisWorldAr(FArchive& Inner) : FObjectAndNameAsStringProxyArchive(Inner, true) { ArNoDelta = true; } // без SaveGame-фильтра
 };
 
-static void Osiris_SerializeSaveGame(UObject* Obj, TArray<uint8>& OutBytes)
+static void Ser(UObject* O, TArray<uint8>& Out)
 {
-	OutBytes.Reset();
-
-	FMemoryWriter Writer(OutBytes, true);
-	FOsirisSaveGameArchive Ar(Writer);
-	Obj->Serialize(Ar);
+	Out.Reset();
+	FMemoryWriter W(Out, true);
+	FOsirisWorldAr Ar(W);
+	O->Serialize(Ar);
 }
 
-static bool Osiris_DeserializeSaveGame(UObject* Obj, const TArray<uint8>& InBytes)
+static void Des(UObject* O, const TArray<uint8>& In)
 {
-	if (InBytes.Num() <= 0) return false;
-
-	FMemoryReader Reader(InBytes,true);
-	FOsirisSaveGameArchive Ar(Reader);
-	Obj->Serialize(Ar);
-	return true;
+	if (!O || In.Num() <= 0) return;
+	FMemoryReader R(In, true);
+	FOsirisWorldAr Ar(R);
+	O->Serialize(Ar);
 }
 
-
-int32 UOsirisSubsystem::GetMarkedActorCount() const
+bool UOsirisSubsystem::SaveGame()
 {
 	UWorld* World = GetWorld();
-	if (!World) return 0;
+	if (!World) return false;
 
-	int32 Count = 0;
+	TArray<AActor*> Marked;
 	for (TActorIterator<AActor> It(World); It; ++It)
-	{
 		if (It->FindComponentByClass<UOsirisSaveComponent>())
-		{
-			++Count;
-		}
-	}
-	return Count;
-}
+			Marked.Add(*It);
 
+	TArray<uint8> Bytes;
+	FMemoryWriter W(Bytes, true);
+	FOsirisWorldAr Ar(W);
 
-void UOsirisSubsystem::GetMarkedPlacedSpawnedCount(int32& OutPlaced, int32& OutSpawned) const
-{
-	OutPlaced = 0;
-	OutSpawned = 0;
+	int32 Count = Marked.Num(); Ar << Count;
 
-	UWorld* World = GetWorld();
-	if (!World) return;
-
-	for (TActorIterator<AActor> It(World); It; ++It)
+	for (AActor* A : Marked)
 	{
-		AActor* Actor = *It;
-		if (!Actor) continue;
+		UOsirisSaveComponent* SC = A ? A->FindComponentByClass<UOsirisSaveComponent>() : nullptr;
+		if (!A || !SC) continue;
 
-		if (!Actor->FindComponentByClass<UOsirisSaveComponent>())
-			continue;
+		if (!SC->OsirisGuid.IsValid()) SC->OsirisGuid = FGuid::NewGuid();
 
-		const bool bPlaced = Actor->HasAnyFlags(RF_WasLoaded);
-		if (bPlaced) ++OutPlaced;
-		else ++OutSpawned;
-	}
-}
+		FGuid Guid = SC->OsirisGuid;
+		FString ClassPath = A->GetClass()->GetPathName();
+		FTransform Xf = A->GetActorTransform();
 
+		TArray<uint8> ABytes; Ser(A, ABytes);
 
-bool UOsirisSubsystem::SaveGameSnapshot(AActor* Target, bool bIncludeComponents)
-{
-	if (!Target) return false;
+		TArray<UActorComponent*> Comps; A->GetComponents(Comps);
+		int32 CCount = Comps.Num();
 
-	if (!Target->FindComponentByClass<UOsirisSaveComponent>())
-		return false;
-
-	LastActorBytes.Reset();
-	LastComponentNames.Reset();
-	LastComponentBytes.Reset();
-
-	Osiris_SerializeSaveGame(Target, LastActorBytes);
-
-	if (bIncludeComponents)
-	{
-		TArray<UActorComponent*> Comps;
-		Target->GetComponents(Comps);
+		Ar << Guid; Ar << ClassPath; Ar << Xf; Ar << ABytes; Ar << CCount;
 
 		for (UActorComponent* C : Comps)
 		{
-			if (!C) continue;
-
-			TArray<uint8> Bytes;
-			Osiris_SerializeSaveGame(C, Bytes);
-
-			LastComponentNames.Add(C->GetFName());
-			LastComponentBytes.Add(MoveTemp(Bytes));
+			FString Name = C ? C->GetFName().ToString() : FString();
+			TArray<uint8> CBytes; if (C) Ser(C, CBytes);
+			Ar << Name; Ar << CBytes;
 		}
 	}
 
-	bHasLastSnapshot = true;
-	return true;
+	UOsirisSaveGame* SG = Cast<UOsirisSaveGame>(UGameplayStatics::CreateSaveGameObject(UOsirisSaveGame::StaticClass()));
+	if (!SG) return false;
+
+	SG->Data = MoveTemp(Bytes);
+	return UGameplayStatics::SaveGameToSlot(SG, GOsirisSlot, 0);
 }
 
-bool UOsirisSubsystem::LoadGameSnapshot(AActor* Target, bool bIncludeComponents) const
+bool UOsirisSubsystem::LoadGame()
 {
-	if (!Target) return false;
-	if (!bHasLastSnapshot) return false;
+	UWorld* World = GetWorld();
+	if (!World) return false;
 
-	if (!Osiris_DeserializeSaveGame(Target, LastActorBytes))
-		return false;
+	UOsirisSaveGame* SG = Cast<UOsirisSaveGame>(UGameplayStatics::LoadGameFromSlot(GOsirisSlot, 0));
+	if (!SG || SG->Data.Num() == 0) return false;
 
-	if (bIncludeComponents)
+	TMap<FGuid, AActor*> Map;
+	for (TActorIterator<AActor> It(World); It; ++It)
+		if (UOsirisSaveComponent* SC = It->FindComponentByClass<UOsirisSaveComponent>())
+			if (SC->OsirisGuid.IsValid())
+				Map.Add(SC->OsirisGuid, *It);
+
+	FMemoryReader R(SG->Data, true);
+	FOsirisWorldAr Ar(R);
+
+	int32 Count = 0;
+	Ar << Count;
+
+	TSet<FGuid> SavedGuids;
+	SavedGuids.Reserve(Count);
+
+	bool bOk = true;
+
+	for (int32 i = 0; i < Count; ++i)
 	{
-		const int32 N = FMath::Min(LastComponentNames.Num(), LastComponentBytes.Num());
+		FGuid Guid; FString ClassPath; FTransform Xf; TArray<uint8> ABytes; int32 CCount = 0;
+		Ar << Guid; Ar << ClassPath; Ar << Xf; Ar << ABytes; Ar << CCount;
 
-		TArray<UActorComponent*> Comps;
-		Target->GetComponents(Comps);
+		SavedGuids.Add(Guid);
 
-		for (int32 i = 0; i < N; ++i)
+		AActor* A = Map.FindRef(Guid);
+
+		if (!A)
 		{
-			const FName WantName = LastComponentNames[i];
-
-			UActorComponent* Found = nullptr;
-			for (UActorComponent* C : Comps)
+			if (UClass* Cls = StaticLoadClass(AActor::StaticClass(), nullptr, *ClassPath))
 			{
-				if (C && C->GetFName() == WantName)
+				FActorSpawnParameters P;
+				P.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+				A = World->SpawnActor<AActor>(Cls, Xf, P);
+
+				if (A)
 				{
-					Found = C;
-					break;
+					if (UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>())
+						SC->SetOsirisGuid(Guid);
+
+					Map.Add(Guid, A);
 				}
 			}
+		}
 
-			if (!Found)
-				continue;
+		if (A)
+		{
+			Des(A, ABytes);
 
-			if (!Osiris_DeserializeSaveGame(Found, LastComponentBytes[i]))
-				return false;
+			TArray<UActorComponent*> Comps;
+			A->GetComponents(Comps);
+
+			for (int32 c = 0; c < CCount; ++c)
+			{
+				FString Name; TArray<uint8> CBytes;
+				Ar << Name; Ar << CBytes;
+
+				const FName Want(*Name);
+				for (UActorComponent* Cmp : Comps)
+					if (Cmp && Cmp->GetFName() == Want) { Des(Cmp, CBytes); break; }
+			}
+
+			A->ReregisterAllComponents();
+			A->SetActorTransform(Xf, false, nullptr, ETeleportType::TeleportPhysics);
+		}
+		else
+		{
+			for (int32 c = 0; c < CCount; ++c) { FString N; TArray<uint8> B; Ar << N; Ar << B; }
+			bOk = false;
 		}
 	}
 
-	return true;
-}
-
-FString UOsirisSubsystem::GetLastSnapshotDebugInfo() const
-{
-	if (!bHasLastSnapshot)
+	TArray<AActor*> ToDestroy;
+	for (TActorIterator<AActor> It(World); It; ++It)
 	{
-		return TEXT("OSIRIS: NO SNAPSHOT");
+		AActor* A = *It;
+		if (!A) continue;
+
+		UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>();
+		if (!SC || !SC->OsirisGuid.IsValid()) continue;
+
+		if (!SavedGuids.Contains(SC->OsirisGuid))
+			ToDestroy.Add(A);
 	}
 
-	return FString::Printf(
-		TEXT("OSIRIS: Snapshot ActorBytes=%d Components=%d"),
-		LastActorBytes.Num(),
-		LastComponentNames.Num()
-	);
+	for (AActor* A : ToDestroy)
+		if (IsValid(A)) A->Destroy();
+
+	return bOk;
 }

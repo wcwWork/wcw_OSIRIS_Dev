@@ -14,7 +14,7 @@ class WCW_OSIRIS_API UOsirisSaveComponent : public UActorComponent
 
 public:
 
-	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "OSIRIS")
+	UPROPERTY(EditInstanceOnly, BlueprintReadOnly, Category = "OSIRIS")
 	FGuid OsirisGuid;
 
 	//** Returns GUID as string for easy Blueprint PrintString. *

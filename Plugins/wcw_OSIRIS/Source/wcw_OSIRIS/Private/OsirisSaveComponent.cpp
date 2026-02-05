@@ -7,12 +7,22 @@
 void UOsirisSaveComponent::OnRegister()
 {
 	Super::OnRegister();
+	if (OsirisGuid.IsValid()) return;
 
-	if (!OsirisGuid.IsValid())
-	{
-		OsirisGuid = FGuid::NewGuid();
-	}
+#if WITH_EDITOR
+	if (GIsEditor)
+		if (UWorld* W = GetWorld())
+			if (!W->IsGameWorld())
+			{
+				if (AActor* Owner = GetOwner()) Owner->Modify();
+				OsirisGuid = FGuid::NewGuid();
+				return;
+			}
+#endif
+
+	OsirisGuid = FGuid::NewGuid();
 }
+
 
 FString UOsirisSaveComponent::GetOsirisGuidString() const
 {
