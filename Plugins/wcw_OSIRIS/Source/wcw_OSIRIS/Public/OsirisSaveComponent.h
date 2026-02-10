@@ -17,6 +17,7 @@ public:
 	UPROPERTY(EditInstanceOnly, BlueprintReadOnly, Category = "OSIRIS")
 	FGuid OsirisGuid;
 
+
 	//** Returns GUID as string for easy Blueprint PrintString. *
 	//** Blueprint の PrintString 用に GUID を文字列で返します。*
 	UFUNCTION(BlueprintCallable, Category = "OSIRIS")
@@ -28,7 +29,5 @@ protected:
 
 	//** Creates a unique GUID on registration if missing. *
 	//** 登録時に GUID が未設定なら新規に生成します。*
-	virtual void OnRegister() override;
-
-		
+	virtual void OnRegister() override;	
 };
