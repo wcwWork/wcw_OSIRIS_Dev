@@ -26,3 +26,5 @@ FString UOsirisSaveComponent::GetOsirisGuidString() const
 }
 
 
+void UOsirisSaveComponent::Osiris_BroadcastPreSave() { OnOsirisPreSave.Broadcast(); }
+void UOsirisSaveComponent::Osiris_BroadcastPostLoad() { OnOsirisPostLoad.Broadcast(); }

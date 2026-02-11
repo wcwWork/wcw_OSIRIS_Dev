@@ -79,7 +79,7 @@ bool UOsirisSubsystem::SaveGame()
 		});
 
 	TArray<uint8> Bytes;
-	FMemoryWriter W(Bytes,true);
+	FMemoryWriter W(Bytes, true);
 	FOsirisWorldAr Ar(W);
 
 	int32 Count = Marked.Num();
@@ -91,6 +91,8 @@ bool UOsirisSubsystem::SaveGame()
 
 		UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>();
 		if (!SC || !SC->OsirisGuid.IsValid()) continue;
+
+		SC->GetOsirisPreSaveHook().Broadcast();
 
 		FGuid Guid = SC->OsirisGuid;
 		FString ClassPath = A->GetClass()->GetPathName();
@@ -166,7 +168,7 @@ bool UOsirisSubsystem::LoadGame()
 	struct FOsirisWorldAr : FObjectAndNameAsStringProxyArchive
 	{
 		FOsirisWorldAr(FArchive& Inner)
-			: FObjectAndNameAsStringProxyArchive(Inner,true)
+			: FObjectAndNameAsStringProxyArchive(Inner, true)
 		{
 			ArIsSaveGame = true;
 			ArNoDelta = true;
@@ -287,6 +289,9 @@ bool UOsirisSubsystem::LoadGame()
 
 		A->ReregisterAllComponents();
 		A->SetActorTransform(Xf, false, nullptr, ETeleportType::TeleportPhysics);
+
+		if (UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>())
+			SC->GetOsirisPostLoadHook().Broadcast();
 	}
 
 	TArray<AActor*> ToDestroy;
@@ -310,3 +315,4 @@ bool UOsirisSubsystem::LoadGame()
 
 	return bOk;
 }
+
