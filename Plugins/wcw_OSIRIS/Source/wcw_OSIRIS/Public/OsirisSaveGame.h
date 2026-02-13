@@ -6,6 +6,14 @@
 #include "GameFramework/SaveGame.h"
 #include "OsirisSaveGame.generated.h"
 
+USTRUCT()
+struct FOsirisDataContainer
+{
+	GENERATED_BODY()
+
+	UPROPERTY() FName WorldId;
+	UPROPERTY() TArray<uint8> Data;
+};
 
 UCLASS()
 class WCW_OSIRIS_API UOsirisSaveGame : public USaveGame
@@ -14,6 +22,6 @@ class WCW_OSIRIS_API UOsirisSaveGame : public USaveGame
 
 public:
 
-	UPROPERTY() TArray<uint8> Data;
+	UPROPERTY() TArray<FOsirisDataContainer> DataContainers;
 	
 };
