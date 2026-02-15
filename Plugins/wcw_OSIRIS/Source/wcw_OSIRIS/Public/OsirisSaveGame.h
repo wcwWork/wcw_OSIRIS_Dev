@@ -11,8 +11,8 @@ struct FOsirisDataContainer
 {
 	GENERATED_BODY()
 
-	UPROPERTY() FName WorldId;
-	UPROPERTY() TArray<uint8> Data;
+	UPROPERTY(SaveGame) FName LevelId = NAME_None;
+	UPROPERTY(SaveGame) TArray<uint8> Data;
 };
 
 UCLASS()
@@ -22,6 +22,7 @@ class WCW_OSIRIS_API UOsirisSaveGame : public USaveGame
 
 public:
 
-	UPROPERTY() TArray<FOsirisDataContainer> DataContainers;
+	UPROPERTY(SaveGame) FName RootMapId = NAME_None;
+	UPROPERTY(SaveGame) TArray<FOsirisDataContainer> DataContainers;
 	
 };

@@ -10,6 +10,7 @@ class WCW_OSIRIS_API UOsirisSubsystem : public UGameInstanceSubsystem
 {
 	GENERATED_BODY()
 public:
+
 	UFUNCTION(BlueprintCallable, Category = "OSIRIS") bool SaveGame();
 	UFUNCTION(BlueprintCallable, Category = "OSIRIS") bool LoadGame();
 };
