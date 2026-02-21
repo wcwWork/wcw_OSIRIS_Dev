@@ -1,4 +1,4 @@
-// Fill out your copyright notice in the Description page of Project Settings.
+//© Developer Nikita Petrachkov in collaboration with WINTER CROWN WORKS, all rights reserved ©
 
 #pragma once
 
@@ -21,8 +21,6 @@ class WCW_OSIRIS_API UOsirisSaveGame : public USaveGame
 	GENERATED_BODY()
 
 public:
-
 	UPROPERTY(SaveGame) FName RootMapId = NAME_None;
 	UPROPERTY(SaveGame) TArray<FOsirisDataContainer> DataContainers;
-	
 };

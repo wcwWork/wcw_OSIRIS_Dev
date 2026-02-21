@@ -1,3 +1,5 @@
+//© Developer Nikita Petrachkov in collaboration with WINTER CROWN WORKS, all rights reserved ©
+
 #include "OsirisSubsystem.h"
 
 #include "OsirisSaveComponent.h"
@@ -5,53 +7,115 @@
 
 #include "Engine/World.h"
 #include "Engine/Level.h"
-#include "Engine/LevelStreaming.h"
-#include "Engine/EngineTypes.h"
-#include "Kismet/GameplayStatics.h"
+#include "EngineUtils.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
-#include "Components/ActorComponent.h"
+#include "Kismet/GameplayStatics.h"
 
 #include "UObject/UnrealType.h"
 #include "UObject/UObjectGlobals.h"
+#include "Misc/PackageName.h"
+
+#include "Components/SceneComponent.h"
 
 #include "Serialization/MemoryWriter.h"
 #include "Serialization/MemoryReader.h"
 #include "Serialization/ObjectAndNameAsStringProxyArchive.h"
 
-#include "Misc/PackageName.h"
-
 static const FString GOsirisSlot = TEXT("OSIRIS_SLOT");
-static const FName   GOsirisPlayerId = TEXT("OSIRIS_PLAYER_0");
+static const FName   GId_ActorDB = TEXT("OSIRIS_ACTOR_DB");
+static const FName   GId_Player = TEXT("OSIRIS_PLAYER");
 
-static TMap<FName, TArray<uint8>> GOsirisLevelData;
-static TArray<uint8>              GOsirisPlayerData;
-static FName                      GOsirisRootMapId = NAME_None;
+static const FName   GTag_OsirisKeep = TEXT("OsirisKeep");
+static const FName   GTag_OSIRIS_KEEP = TEXT("OSIRIS_KEEP");
+static const FName   GTag_OsirisNoDestroy = TEXT("OsirisNoDestroy");
 
-static bool                       GOsirisPending = false;
-static bool                       GOsirisIgnoreStreamingCapture = false;
-static FName                      GOsirisPendingRootMap = NAME_None;
-static TWeakObjectPtr<UWorld>     GOsirisPendingWorld;
+static constexpr int32  GOsiris_DB_Version = 2;
+static constexpr int32  GMaxActorRecords = 500000;
+static constexpr int32  GMaxCompPerActor = 4096;
+static constexpr int32  GMaxBytes_Actor = 32 * 1024 * 1024;
+static constexpr int32  GMaxBytes_Comp = 16 * 1024 * 1024;
+static constexpr int32  GMaxBytes_PlayerBlob = 64 * 1024 * 1024;
+static constexpr int32  GQuietTicksToFinish = 60;
 
-static TWeakObjectPtr<UWorld>     GOsirisSessionWorld;
+static constexpr uint32 GPlayerMagic = 0x4F535056;
+static constexpr int32  GPlayerVersion = 2;
 
-static FDelegateHandle            GOsirisPostLoadH;
-static FDelegateHandle            GOsirisTickH;
-static FDelegateHandle            GOsirisPostWorldInitH;
-static FDelegateHandle            GOsirisLevelAddedH;
-static FDelegateHandle            GOsirisLevelRemovedH;
-
-struct FOsirisAr : FObjectAndNameAsStringProxyArchive
+struct FOsirisObjAr : FObjectAndNameAsStringProxyArchive
 {
-	FOsirisAr(FArchive& Inner) : FObjectAndNameAsStringProxyArchive(Inner, true)
+	FOsirisObjAr(FArchive& Inner)
+		: FObjectAndNameAsStringProxyArchive(Inner, true)
 	{
 		ArIsSaveGame = true;
 		ArNoDelta = true;
 	}
 };
 
-static bool OsirisHasAnySaveGameProps(const UObject* Obj)
+static void WriteGuid(FArchive& Ar, const FGuid& G)
+{
+	uint32 A = G.A, B = G.B, C = G.C, D = G.D;
+	Ar << A; Ar << B; Ar << C; Ar << D;
+}
+
+static void ReadGuid(FArchive& Ar, FGuid& G)
+{
+	uint32 A = 0, B = 0, C = 0, D = 0;
+	Ar << A; Ar << B; Ar << C; Ar << D;
+	G = FGuid(A, B, C, D);
+}
+
+static void WriteNameStr(FArchive& Ar, const FName& N)
+{
+	FString S = N.IsNone() ? FString() : N.ToString();
+	Ar << S;
+}
+
+static void ReadNameStr(FArchive& Ar, FName& N)
+{
+	FString S;
+	Ar << S;
+	N = S.IsEmpty() ? NAME_None : FName(*S);
+}
+
+static void WriteBool(FArchive& Ar, bool b)
+{
+	uint8 V = b ? 1 : 0;
+	Ar << V;
+}
+
+static bool ReadBool(FArchive& Ar, bool& bOut)
+{
+	uint8 V = 0;
+	Ar << V;
+	if (Ar.IsError()) return false;
+	bOut = (V != 0);
+	return true;
+}
+
+static void WriteBytes(FArchive& Ar, const TArray<uint8>& Bytes)
+{
+	int32 Size = Bytes.Num();
+	Ar << Size;
+	if (Size > 0) Ar.Serialize((void*)Bytes.GetData(), Size);
+}
+
+static bool ReadBytes(FArchive& Ar, TArray<uint8>& Out, int32 MaxAllowed)
+{
+	int32 Size = 0;
+	Ar << Size;
+	if (Ar.IsError()) return false;
+	if (Size < 0 || Size > MaxAllowed) return false;
+
+	Out.Reset();
+	if (Size == 0) return true;
+
+	Out.SetNumUninitialized(Size);
+	Ar.Serialize(Out.GetData(), Size);
+	return !Ar.IsError();
+}
+
+static bool HasAnySaveGameProps(const UObject* Obj)
 {
 	if (!Obj) return false;
 	for (TFieldIterator<FProperty> It(Obj->GetClass()); It; ++It)
@@ -60,679 +124,1263 @@ static bool OsirisHasAnySaveGameProps(const UObject* Obj)
 	return false;
 }
 
-static bool OsirisLessGuid(const FGuid& L, const FGuid& R)
+static bool IsWorldReady(UWorld* World)
 {
-	if (L.A != R.A) return L.A < R.A;
-	if (L.B != R.B) return L.B < R.B;
-	if (L.C != R.C) return L.C < R.C;
-	return L.D < R.D;
+	if (!World || !World->IsGameWorld() || !World->HasBegunPlay()) return false;
+	APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0);
+	if (!PC) return false;
+	APawn* P = PC->GetPawn();
+	if (!P) return false;
+	return (P->GetController() == PC);
 }
 
-static bool OsirisReady(UWorld* W)
+static FString StripUEDPIEPrefix(FString In)
 {
-	if (!W || !W->HasBegunPlay()) return false;
-	APlayerController* PC = UGameplayStatics::GetPlayerController(W, 0);
-	APawn* P = PC ? PC->GetPawn() : nullptr;
-	return PC && P && P->GetController() == PC;
+	auto StripInNamePart = [](const FString& NamePart) -> FString
+	{
+		if (!NamePart.StartsWith(TEXT("UEDPIE_"))) return NamePart;
+		int32 i = 7;
+		while (i < NamePart.Len() && FChar::IsDigit(NamePart[i])) ++i;
+		if (i < NamePart.Len() && NamePart[i] == TEXT('_')) ++i;
+		return NamePart.Mid(i);
+	};
+
+	int32 Slash = INDEX_NONE;
+	if (In.FindLastChar(TEXT('/'), Slash))
+	{
+		const FString Path = In.Left(Slash + 1);
+		const FString Name = In.Mid(Slash + 1);
+		return Path + StripInNamePart(Name);
+	}
+	return StripInNamePart(In);
 }
 
-static FName OsirisGetRootMapId(UWorld* World)
+static FString NormalizePackageLikeName(FString In)
+{
+	In = StripUEDPIEPrefix(MoveTemp(In));
+	UWorld::RemovePIEPrefix(In);
+	return In;
+}
+
+static FName MakeNameFromStringNormalized(const FString& S)
+{
+	const FString N = NormalizePackageLikeName(S);
+	return N.IsEmpty() ? NAME_None : FName(*N);
+}
+
+static FName GetRootMapIdCanonical(UWorld* World)
 {
 	if (!World) return NAME_None;
-	return FName(*UGameplayStatics::GetCurrentLevelName(World, true));
+
+	UPackage* Pkg = nullptr;
+	if (World->PersistentLevel) Pkg = World->PersistentLevel->GetOutermost();
+	if (!Pkg) Pkg = World->GetOutermost();
+
+	FString Name = Pkg ? Pkg->GetName() : UGameplayStatics::GetCurrentLevelName(World, true);
+	Name = NormalizePackageLikeName(MoveTemp(Name));
+	return Name.IsEmpty() ? NAME_None : FName(*Name);
 }
 
-static FName OsirisGetStreamingLevelShortId(ULevelStreaming* SL)
+static FName GetRootMapIdLegacyShort(UWorld* World)
 {
-	if (!SL) return NAME_None;
-	const FString Pkg = SL->GetWorldAssetPackageName();
-	if (Pkg.IsEmpty()) return NAME_None;
-	return FName(*FPackageName::GetShortName(Pkg));
+	if (!World) return NAME_None;
+	FString Short = UGameplayStatics::GetCurrentLevelName(World, true);
+	Short = NormalizePackageLikeName(MoveTemp(Short));
+	return Short.IsEmpty() ? NAME_None : FName(*Short);
 }
 
-static FName OsirisGetLevelId(UWorld* World, ULevel* Level)
+static void GetRootAliases(UWorld* World, TArray<FName>& OutAliases)
 {
-	if (!World || !Level) return NAME_None;
-	if (Level == World->PersistentLevel) return OsirisGetRootMapId(World);
+	OutAliases.Reset();
+	if (!World) return;
 
-	for (ULevelStreaming* SL : World->GetStreamingLevels())
+	const FName Canon = GetRootMapIdCanonical(World);
+	if (!Canon.IsNone()) OutAliases.Add(Canon);
+
+	const FName LegacyShort = GetRootMapIdLegacyShort(World);
+	if (!LegacyShort.IsNone() && LegacyShort != Canon) OutAliases.Add(LegacyShort);
+
+	if (!Canon.IsNone())
 	{
-		if (!SL) continue;
-		if (SL->GetLoadedLevel() == Level)
+		const FString CanonStr = Canon.ToString();
+		const FString ShortPkg = FPackageName::GetShortName(CanonStr);
+		if (!ShortPkg.IsEmpty())
 		{
-			const FName Id = OsirisGetStreamingLevelShortId(SL);
-			if (!Id.IsNone()) return Id;
+			const FName ShortName(*ShortPkg);
+			if (ShortName != Canon && !OutAliases.Contains(ShortName))
+				OutAliases.Add(ShortName);
 		}
 	}
-
-	const FString Pkg = Level->GetOutermost() ? Level->GetOutermost()->GetName() : FString();
-	if (Pkg.IsEmpty()) return NAME_None;
-	return FName(*FPackageName::GetShortName(Pkg));
 }
 
-static bool OsirisIsStreamingLevelVisible(UWorld* World, ULevel* Level)
+static bool DoesWorldMatchPendingRoot(UWorld* World, const FName PendingRoot)
 {
-	if (!World || !Level) return false;
-	if (Level == World->PersistentLevel) return true;
+	if (!World || PendingRoot.IsNone()) return false;
 
-	for (ULevelStreaming* SL : World->GetStreamingLevels())
-	{
-		if (!SL) continue;
-		if (SL->GetLoadedLevel() == Level)
-			return SL->IsLevelLoaded() && SL->IsLevelVisible();
-	}
+	TArray<FName> Aliases;
+	GetRootAliases(World, Aliases);
+
+	for (const FName& A : Aliases)
+		if (A == PendingRoot)
+			return true;
+
+	const FString P = NormalizePackageLikeName(PendingRoot.ToString());
+	for (const FName& A : Aliases)
+		if (NormalizePackageLikeName(A.ToString()) == P)
+			return true;
 
 	return false;
 }
 
-static void OsirisEnsureRoot(UWorld* World)
+static FName GetContainerIdCanonical(UWorld* World, ULevel* Level)
 {
-	if (!World) return;
-	const FName Cur = OsirisGetRootMapId(World);
-	if (Cur.IsNone()) return;
+	if (!World || !Level) return NAME_None;
 
-	if (GOsirisRootMapId.IsNone())
+	UPackage* Pkg = Level->GetOutermost();
+	if (!Pkg)
 	{
-		GOsirisRootMapId = Cur;
-		return;
+		if (Level == World->PersistentLevel) return GetRootMapIdCanonical(World);
+		return NAME_None;
 	}
 
-	if (GOsirisRootMapId != Cur)
+	FString Name = Pkg->GetName();
+	Name = NormalizePackageLikeName(MoveTemp(Name));
+	return Name.IsEmpty() ? NAME_None : FName(*Name);
+}
+
+static void GetContainerAliases(UWorld* World, ULevel* Level, TArray<FName>& OutAliases)
+{
+	OutAliases.Reset();
+	if (!World || !Level) return;
+
+	const FName Canon = GetContainerIdCanonical(World, Level);
+	if (!Canon.IsNone()) OutAliases.Add(Canon);
+
+	if (Level == World->PersistentLevel)
 	{
-		GOsirisRootMapId = Cur;
-		if (!GOsirisPending)
+		const FName LegacyShort = GetRootMapIdLegacyShort(World);
+		if (!LegacyShort.IsNone() && LegacyShort != Canon)
+			OutAliases.Add(LegacyShort);
+	}
+
+	if (!Canon.IsNone())
+	{
+		const FString CanonStr = Canon.ToString();
+		const FString ShortPkg = FPackageName::GetShortName(CanonStr);
+		if (!ShortPkg.IsEmpty())
 		{
-			GOsirisLevelData.Reset();
-			GOsirisPlayerData.Reset();
+			const FName ShortName(*ShortPkg);
+			if (ShortName != Canon && !OutAliases.Contains(ShortName))
+				OutAliases.Add(ShortName);
 		}
 	}
 }
 
-static void OsirisResetForNewSession(UWorld* World)
+static bool ShouldProtectFromDestroy(const AActor* A)
 {
-	if (!World || !World->IsGameWorld()) return;
-	if (GOsirisPending) return;
-
-	if (!GOsirisSessionWorld.IsValid() || GOsirisSessionWorld.Get() != World)
-	{
-		GOsirisSessionWorld = World;
-		GOsirisRootMapId = OsirisGetRootMapId(World);
-		GOsirisLevelData.Reset();
-		GOsirisPlayerData.Reset();
-		GOsirisIgnoreStreamingCapture = false;
-		GOsirisPending = false;
-		GOsirisPendingRootMap = NAME_None;
-		GOsirisPendingWorld.Reset();
-	}
+	if (!A) return false;
+	return A->ActorHasTag(GTag_OsirisKeep) ||
+		A->ActorHasTag(GTag_OSIRIS_KEEP) ||
+		A->ActorHasTag(GTag_OsirisNoDestroy);
 }
 
-static bool OsirisCapturePlayer(UWorld* World, TArray<uint8>& Out)
+static void GatherLevelActors(UWorld* World, ULevel* Level, TArray<AActor*>& OutActors)
 {
-	Out.Reset();
-	if (!World) return false;
+	OutActors.Reset();
+	if (!Level) return;
 
-	APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0);
-	APawn* Pawn = PC ? PC->GetPawn() : nullptr;
-	if (!Pawn) return true;
-
-	UOsirisSaveComponent* SC = Pawn->FindComponentByClass<UOsirisSaveComponent>();
-	if (!SC) return true;
-	if (!SC->OsirisGuid.IsValid()) SC->OsirisGuid = FGuid::NewGuid();
-
-	FMemoryWriter W(Out, true);
-	FOsirisAr Ar(W);
-
-	int32 Count = 1;
-	Ar << Count;
-
-	SC->GetOsirisPreSaveHook().Broadcast();
-
-	FGuid Guid = SC->OsirisGuid;
-	FString ClassPath = Pawn->GetClass()->GetPathName();
-	FTransform Xf = Pawn->GetActorTransform();
-
-	TArray<uint8> ABytes;
-	{
-		FMemoryWriter AW(ABytes, true);
-		FOsirisAr AAr(AW);
-		Pawn->Serialize(AAr);
-	}
-
-	TArray<UActorComponent*> AllComps; Pawn->GetComponents(AllComps);
-	TArray<UActorComponent*> SavableComps; SavableComps.Reserve(AllComps.Num());
-
-	for (UActorComponent* C : AllComps)
-		if (C && !C->HasAnyFlags(RF_Transient) && OsirisHasAnySaveGameProps(C))
-			SavableComps.Add(C);
-
-	SavableComps.Sort([](const UActorComponent& L, const UActorComponent& R) { return L.GetName() < R.GetName(); });
-
-	int32 CCount = SavableComps.Num();
-
-	Ar << Guid;
-	Ar << ClassPath;
-	Ar << Xf;
-	Ar << ABytes;
-	Ar << CCount;
-
-	for (UActorComponent* C : SavableComps)
-	{
-		FString Name = C->GetFName().ToString();
-		TArray<uint8> CBytes;
-
-		{
-			FMemoryWriter CW(CBytes, true);
-			FOsirisAr CAr(CW);
-			C->Serialize(CAr);
-		}
-
-		Ar << Name;
-		Ar << CBytes;
-	}
-
-	return true;
-}
-
-static bool OsirisCaptureLevel(UWorld* World, ULevel* Level, TArray<uint8>& Out)
-{
-	Out.Reset();
-	if (!World || !Level) return false;
-
-	APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0);
-	APawn* Pawn = PC ? PC->GetPawn() : nullptr;
-
-	TArray<AActor*> Actors;
-	Actors.Reserve(Level->Actors.Num());
+	TSet<AActor*> Unique;
+	Unique.Reserve(FMath::Max(64, Level->Actors.Num()));
 
 	for (AActor* A : Level->Actors)
+		if (A) Unique.Add(A);
+
+	if (World)
 	{
-		if (!A || A == Pawn) continue;
-		UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>();
-		if (!SC) continue;
-		if (!SC->OsirisGuid.IsValid()) SC->OsirisGuid = FGuid::NewGuid();
-		Actors.Add(A);
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			AActor* A = *It;
+			if (A && A->GetLevel() == Level)
+				Unique.Add(A);
+		}
 	}
 
-	Actors.Sort([](const AActor& L, const AActor& R)
-		{
-			const UOsirisSaveComponent* LSC = L.FindComponentByClass<UOsirisSaveComponent>();
-			const UOsirisSaveComponent* RSC = R.FindComponentByClass<UOsirisSaveComponent>();
-			const FGuid LG = (LSC && LSC->OsirisGuid.IsValid()) ? LSC->OsirisGuid : FGuid();
-			const FGuid RG = (RSC && RSC->OsirisGuid.IsValid()) ? RSC->OsirisGuid : FGuid();
-			return OsirisLessGuid(LG, RG);
-		});
+	OutActors.Reserve(Unique.Num());
+	for (AActor* A : Unique)
+		OutActors.Add(A);
+}
 
-	FMemoryWriter W(Out, true);
-	FOsirisAr Ar(W);
-
-	int32 Count = Actors.Num();
-	Ar << Count;
-
-	for (AActor* A : Actors)
+struct UOsirisSubsystem::FImpl
+{
+	struct FCompRecord
 	{
-		if (!A) continue;
+		FString Name;
+		FString ClassPath;
+		bool bDynamic = false;
+		TArray<uint8> Bytes;
+	};
 
-		UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>();
-		if (!SC || !SC->OsirisGuid.IsValid()) continue;
+	struct FActorRecord
+	{
+		FName ContainerId = NAME_None;
+		FGuid Guid;
+		FString ClassPath;
+		FTransform Transform;
+		TArray<uint8> ActorBytes;
+		TArray<FCompRecord> Comps;
+	};
+
+	FName RootMapId = NAME_None;
+
+	TMap<FGuid, FActorRecord> ActorDB;
+	TMap<FName, TArray<FGuid>> ContainerIndex;
+
+	TArray<uint8> PlayerBlob;
+
+	bool bPendingLoad = false;
+	bool bIgnoreCapture = false;
+	FName PendingRootMap = NAME_None;
+
+	int32 QuietTicks = 0;
+
+	bool bPlayerEarlyApplied = false;
+	bool bPlayerFullApplied = false;
+
+	TSet<FName> AppliedContainersDuringLoad;
+
+	TWeakObjectPtr<UWorld> SessionWorld;
+
+	FDelegateHandle H_PostLoadMap;
+	FDelegateHandle H_Tick;
+	FDelegateHandle H_LevelAdded;
+	FDelegateHandle H_LevelRemoved;
+
+	void Bind()
+	{
+		H_PostLoadMap = FCoreUObjectDelegates::PostLoadMapWithWorld.AddLambda(
+			[this](UWorld* World) { OnPostLoadMap(World); });
+
+		H_Tick = FWorldDelegates::OnWorldTickStart.AddLambda(
+			[this](UWorld* World, ELevelTick TickType, float DeltaSeconds)
+			{
+				OnWorldTickStart(World, TickType, DeltaSeconds);
+			});
+
+		H_LevelAdded = FWorldDelegates::LevelAddedToWorld.AddLambda(
+			[this](ULevel* Level, UWorld* World) { OnLevelAdded(Level, World); });
+
+		H_LevelRemoved = FWorldDelegates::LevelRemovedFromWorld.AddLambda(
+			[this](ULevel* Level, UWorld* World) { OnLevelRemoved(Level, World); });
+	}
+
+	void Unbind()
+	{
+		if (H_PostLoadMap.IsValid())  FCoreUObjectDelegates::PostLoadMapWithWorld.Remove(H_PostLoadMap);
+		if (H_Tick.IsValid())         FWorldDelegates::OnWorldTickStart.Remove(H_Tick);
+		if (H_LevelAdded.IsValid())   FWorldDelegates::LevelAddedToWorld.Remove(H_LevelAdded);
+		if (H_LevelRemoved.IsValid()) FWorldDelegates::LevelRemovedFromWorld.Remove(H_LevelRemoved);
+
+		H_PostLoadMap.Reset();
+		H_Tick.Reset();
+		H_LevelAdded.Reset();
+		H_LevelRemoved.Reset();
+	}
+
+	void ResetSession(UWorld* World)
+	{
+		SessionWorld = World;
+		RootMapId = GetRootMapIdCanonical(World);
+
+		ActorDB.Reset();
+		ContainerIndex.Reset();
+		PlayerBlob.Reset();
+
+		bPendingLoad = false;
+		bIgnoreCapture = false;
+		PendingRootMap = NAME_None;
+
+		QuietTicks = 0;
+		bPlayerEarlyApplied = false;
+		bPlayerFullApplied = false;
+		AppliedContainersDuringLoad.Reset();
+	}
+
+	void RebuildIndexAll()
+	{
+		ContainerIndex.Reset();
+
+		for (const TPair<FGuid, FActorRecord>& Kvp : ActorDB)
+		{
+			const FActorRecord& R = Kvp.Value;
+			if (!R.ContainerId.IsNone())
+				ContainerIndex.FindOrAdd(R.ContainerId).Add(Kvp.Key);
+		}
+
+		for (TPair<FName, TArray<FGuid>>& Kvp : ContainerIndex)
+		{
+			Kvp.Value.Sort([](const FGuid& A, const FGuid& B)
+				{
+					if (A.A != B.A) return A.A < B.A;
+					if (A.B != B.B) return A.B < B.B;
+					if (A.C != B.C) return A.C < B.C;
+					return A.D < B.D;
+				});
+		}
+	}
+
+	static bool IsDynamicSavableComponent(const UActorComponent* C)
+	{
+		if (!C) return false;
+		if (C->IsDefaultSubobject()) return false;
+
+		const AActor* Owner = C->GetOwner();
+		if (Owner)
+		{
+			const TArray<UActorComponent*>& IC = Owner->GetInstanceComponents();
+			if (IC.Contains(C)) return true;
+		}
+
+		return (C->CreationMethod == EComponentCreationMethod::Instance) ||
+			(C->CreationMethod == EComponentCreationMethod::UserConstructionScript);
+	}
+
+	static UActorComponent* EnsureDynamicComponent(AActor* A, const FString& NameStr, const FString& ClassPath)
+	{
+		if (!A || NameStr.IsEmpty() || ClassPath.IsEmpty()) return nullptr;
+
+		const FName Want(*NameStr);
+		{
+			TArray<UActorComponent*> Existing;
+			A->GetComponents(Existing);
+			for (UActorComponent* C : Existing)
+				if (C && C->GetFName() == Want)
+					return C;
+		}
+
+		UClass* Cls = StaticLoadClass(UActorComponent::StaticClass(), nullptr, *ClassPath);
+		if (!Cls) return nullptr;
+
+		UActorComponent* NewC = NewObject<UActorComponent>(A, Cls, Want);
+		if (!NewC) return nullptr;
+
+		if (USceneComponent* Scene = Cast<USceneComponent>(NewC))
+		{
+			if (USceneComponent* Root = A->GetRootComponent())
+				Scene->SetupAttachment(Root);
+			else
+				A->SetRootComponent(Scene);
+		}
+
+		NewC->OnComponentCreated();
+		A->AddInstanceComponent(NewC);
+		NewC->RegisterComponent();
+
+		return NewC;
+	}
+
+	void CapturePlayer(UWorld* World)
+	{
+		PlayerBlob.Reset();
+		if (!World) return;
+
+		APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0);
+		APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+		if (!Pawn) return;
+
+		UOsirisSaveComponent* SC = Pawn->FindComponentByClass<UOsirisSaveComponent>();
+		if (!SC) return;
+
+		if (!SC->OsirisGuid.IsValid())
+			SC->OsirisGuid = FGuid::NewGuid();
 
 		SC->GetOsirisPreSaveHook().Broadcast();
 
-		FGuid Guid = SC->OsirisGuid;
-		FString ClassPath = A->GetClass()->GetPathName();
-		FTransform Xf = A->GetActorTransform();
+		const FGuid Guid = SC->OsirisGuid;
+		FString ClassPath = Pawn->GetClass()->GetPathName();
+		const FTransform Xf = Pawn->GetActorTransform();
 
-		TArray<uint8> ABytes;
+		TArray<uint8> ActorBytes;
 		{
-			FMemoryWriter AW(ABytes, true);
-			FOsirisAr AAr(AW);
-			A->Serialize(AAr);
+			FMemoryWriter AW(ActorBytes, true);
+			FOsirisObjAr AAr(AW);
+			Pawn->Serialize(AAr);
 		}
 
-		TArray<UActorComponent*> AllComps; A->GetComponents(AllComps);
-		TArray<UActorComponent*> SavableComps; SavableComps.Reserve(AllComps.Num());
+		TArray<UActorComponent*> All; Pawn->GetComponents(All);
+		TArray<UActorComponent*> Savable;
+		for (UActorComponent* C : All)
+			if (C && !C->HasAnyFlags(RF_Transient) && (HasAnySaveGameProps(C) || IsDynamicSavableComponent(C)))
+				Savable.Add(C);
 
-		for (UActorComponent* C : AllComps)
-			if (C && !C->HasAnyFlags(RF_Transient) && OsirisHasAnySaveGameProps(C))
-				SavableComps.Add(C);
+		Savable.Sort([](const UActorComponent& L, const UActorComponent& R)
+			{
+				return L.GetName() < R.GetName();
+			});
 
-		SavableComps.Sort([](const UActorComponent& L, const UActorComponent& R) { return L.GetName() < R.GetName(); });
+		FMemoryWriter W(PlayerBlob, true);
+		FArchive& Ar = W;
 
-		int32 CCount = SavableComps.Num();
+		{
+			uint32 Magic = GPlayerMagic;
+			int32 Ver = GPlayerVersion;
+			Ar << Magic;
+			Ar << Ver;
+		}
 
-		Ar << Guid;
+		WriteGuid(Ar, Guid);
 		Ar << ClassPath;
-		Ar << Xf;
-		Ar << ABytes;
+
+		FVector Loc = Xf.GetLocation();
+		FQuat Rot = Xf.GetRotation();
+		FVector Scale = Xf.GetScale3D();
+		Ar << Loc; Ar << Rot; Ar << Scale;
+
+		WriteBytes(Ar, ActorBytes);
+
+		int32 CCount = Savable.Num();
 		Ar << CCount;
 
-		for (UActorComponent* C : SavableComps)
+		for (UActorComponent* C : Savable)
 		{
-			FString Name = C->GetFName().ToString();
-			TArray<uint8> CBytes;
+			FString NameStr = C->GetFName().ToString();
+			FString CompClassPath = C->GetClass()->GetPathName();
+			const bool bDyn = IsDynamicSavableComponent(C);
 
+			TArray<uint8> B;
 			{
-				FMemoryWriter CW(CBytes, true);
-				FOsirisAr CAr(CW);
+				FMemoryWriter CW(B, true);
+				FOsirisObjAr CAr(CW);
 				C->Serialize(CAr);
 			}
 
-			Ar << Name;
-			Ar << CBytes;
+			Ar << NameStr;
+			Ar << CompClassPath;
+			WriteBool(Ar, bDyn);
+			WriteBytes(Ar, B);
 		}
 	}
 
-	return true;
-}
-
-static bool OsirisApplyToLevel(UWorld* World, ULevel* Level, const TArray<uint8>& In, bool bSpawn, bool bDestroy, AActor* Forced)
-{
-	if (!World || !Level) return false;
-	if (In.Num() == 0) return true;
-
-	TMap<FGuid, AActor*> Map;
-	if (!Forced)
+	static bool ReadPlayerHeader(const TArray<uint8>& Blob, int32& OutStartOffset, int32& OutVer)
 	{
-		for (AActor* A : Level->Actors)
-		{
-			if (!A) continue;
-			if (APawn* P = Cast<APawn>(A); P && P->IsPlayerControlled()) continue;
+		OutStartOffset = 0;
+		OutVer = 0;
+		if (Blob.Num() < 8) return false;
 
-			if (UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>())
-				if (SC->OsirisGuid.IsValid())
-					Map.Add(SC->OsirisGuid, A);
-		}
+		FMemoryReader R(Blob, true);
+		FArchive& Ar = R;
+
+		uint32 Magic = 0;
+		int32 Ver = 0;
+		Ar << Magic;
+		Ar << Ver;
+
+		if (Ar.IsError()) return false;
+		if (Magic != GPlayerMagic) return false;
+		if (Ver != GPlayerVersion) return false;
+
+		OutStartOffset = 8;
+		OutVer = Ver;
+		return true;
 	}
 
-	FMemoryReader R(In, true);
-	FOsirisAr Ar(R);
-
-	int32 Count = 0;
-	Ar << Count;
-
-	TSet<FGuid> SavedGuids;
-	SavedGuids.Reserve(Count);
-
-	bool bOk = true;
-
-	for (int32 i = 0; i < Count; ++i)
+	void ApplyPlayerEarlyTransform(UWorld* World)
 	{
-		FGuid Guid;
+		if (!World || PlayerBlob.Num() == 0) return;
+
+		APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0);
+		APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+		if (!Pawn) return;
+
+		int32 StartOffset = 0;
+		int32 Ver = 0;
+		if (!ReadPlayerHeader(PlayerBlob, StartOffset, Ver)) return;
+
+		FMemoryReader R(PlayerBlob, true);
+		R.Seek(StartOffset);
+		FArchive& Ar = R;
+
+		FGuid Guid; ReadGuid(Ar, Guid);
+
 		FString ClassPath;
-		FTransform Xf;
-		TArray<uint8> ABytes;
-		int32 CCount = 0;
-
-		Ar << Guid;
 		Ar << ClassPath;
-		Ar << Xf;
-		Ar << ABytes;
+
+		FVector Loc; FQuat Rot; FVector Scale;
+		Ar << Loc; Ar << Rot; Ar << Scale;
+
+		Pawn->SetActorTransform(FTransform(Rot, Loc, Scale), false, nullptr, ETeleportType::TeleportPhysics);
+	}
+
+	void ApplyPlayerFull(UWorld* World)
+	{
+		if (!World || PlayerBlob.Num() == 0) return;
+
+		APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0);
+		APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+		if (!Pawn) return;
+
+		UOsirisSaveComponent* SC = Pawn->FindComponentByClass<UOsirisSaveComponent>();
+		if (!SC) return;
+
+		int32 StartOffset = 0;
+		int32 Ver = 0;
+		if (!ReadPlayerHeader(PlayerBlob, StartOffset, Ver)) return;
+
+		FMemoryReader R(PlayerBlob, true);
+		R.Seek(StartOffset);
+		FArchive& Ar = R;
+
+		FGuid Guid; ReadGuid(Ar, Guid);
+
+		FString ClassPath;
+		Ar << ClassPath;
+
+		FVector Loc; FQuat Rot; FVector Scale;
+		Ar << Loc; Ar << Rot; Ar << Scale;
+
+		TArray<uint8> ABytes;
+		if (!ReadBytes(Ar, ABytes, GMaxBytes_PlayerBlob)) return;
+
+		int32 CCount = 0;
 		Ar << CCount;
+		if (Ar.IsError()) return;
+		if (CCount < 0 || CCount > GMaxCompPerActor) return;
 
-		SavedGuids.Add(Guid);
-
-		AActor* A = Forced ? Forced : Map.FindRef(Guid);
-
-		if (!A && bSpawn)
+		struct FTempComp
 		{
-			if (UClass* Cls = StaticLoadClass(AActor::StaticClass(), nullptr, *ClassPath))
+			FString Name;
+			FString ClassPath;
+			bool bDynamic = false;
+			TArray<uint8> Bytes;
+		};
+
+		TArray<FTempComp> Temp;
+		Temp.Reserve(CCount);
+
+		for (int32 i = 0; i < CCount; ++i)
+		{
+			FTempComp T;
+			Ar << T.Name;
+			Ar << T.ClassPath;
+			if (!ReadBool(Ar, T.bDynamic)) return;
+			if (!ReadBytes(Ar, T.Bytes, GMaxBytes_Comp)) return;
+			Temp.Add(MoveTemp(T));
+		}
+
+		for (const FTempComp& T : Temp)
+			if (T.bDynamic)
+				EnsureDynamicComponent(Pawn, T.Name, T.ClassPath);
+
+		if (ABytes.Num() > 0)
+		{
+			FMemoryReader AR(ABytes, true);
+			FOsirisObjAr AAr(AR);
+			Pawn->Serialize(AAr);
+		}
+
+		TArray<UActorComponent*> Comps;
+		Pawn->GetComponents(Comps);
+
+		for (const FTempComp& T : Temp)
+		{
+			if (T.Name.IsEmpty() || T.Bytes.Num() == 0) continue;
+
+			const FName Want(*T.Name);
+			for (UActorComponent* C : Comps)
 			{
-				FActorSpawnParameters P;
-				P.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-				P.OverrideLevel = Level;
-
-				A = World->SpawnActor<AActor>(Cls, Xf, P);
-				if (A)
+				if (C && C->GetFName() == Want)
 				{
-					if (UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>())
-						SC->SetOsirisGuid(Guid);
-
-					Map.Add(Guid, A);
+					FMemoryReader CR(T.Bytes, true);
+					FOsirisObjAr CAr(CR);
+					C->Serialize(CAr);
+					break;
 				}
 			}
 		}
 
-		if (!A)
+		Pawn->ReregisterAllComponents();
+		Pawn->SetActorTransform(FTransform(Rot, Loc, Scale), false, nullptr, ETeleportType::TeleportPhysics);
+
+		SC->GetOsirisPostLoadHook().Broadcast();
+	}
+
+	void RemoveRecordsForContainerAliases(const TArray<FName>& Aliases)
+	{
+		if (Aliases.Num() == 0) return;
+
+		for (const FName& Cid : Aliases)
 		{
-			for (int32 c = 0; c < CCount; ++c)
+			if (const TArray<FGuid>* Old = ContainerIndex.Find(Cid))
 			{
-				FString N; TArray<uint8> B;
-				Ar << N; Ar << B;
+				for (const FGuid& G : *Old)
+				{
+					const FActorRecord* R = ActorDB.Find(G);
+					if (R && Aliases.Contains(R->ContainerId))
+						ActorDB.Remove(G);
+				}
 			}
-			if (bSpawn) bOk = false;
-			continue;
 		}
 
-		if (ABytes.Num())
+		for (auto It = ActorDB.CreateIterator(); It; ++It)
+			if (Aliases.Contains(It.Value().ContainerId))
+				It.RemoveCurrent();
+
+		for (const FName& Cid : Aliases)
+			ContainerIndex.Remove(Cid);
+	}
+
+	void CaptureLevel(UWorld* World, ULevel* Level)
+	{
+		if (!World || !Level) return;
+
+		TArray<FName> Aliases;
+		GetContainerAliases(World, Level, Aliases);
+
+		const FName Canon = GetContainerIdCanonical(World, Level);
+		if (Canon.IsNone()) return;
+
+		RemoveRecordsForContainerAliases(Aliases);
+
+		APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0);
+		APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+
+		TArray<FGuid> NewGuids;
+
+		TArray<AActor*> Candidates;
+		GatherLevelActors(World, Level, Candidates);
+
+		for (AActor* A : Candidates)
 		{
-			FMemoryReader AR(ABytes, true);
-			FOsirisAr AAr(AR);
-			A->Serialize(AAr);
+			if (!A) continue;
+			if (!IsValid(A)) continue;
+			if (A == Pawn) continue;
+			if (A->HasAnyFlags(RF_Transient)) continue;
+
+			UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>();
+			if (!SC) continue;
+
+			if (!SC->OsirisGuid.IsValid())
+				SC->OsirisGuid = FGuid::NewGuid();
+
+			SC->GetOsirisPreSaveHook().Broadcast();
+
+			FActorRecord Rec;
+			Rec.ContainerId = Canon;
+			Rec.Guid = SC->OsirisGuid;
+			Rec.ClassPath = A->GetClass()->GetPathName();
+			Rec.Transform = A->GetActorTransform();
+
+			{
+				FMemoryWriter W(Rec.ActorBytes, true);
+				FOsirisObjAr ObjAr(W);
+				A->Serialize(ObjAr);
+			}
+
+			TArray<UActorComponent*> All; A->GetComponents(All);
+			TArray<UActorComponent*> Savable;
+			for (UActorComponent* C : All)
+				if (C && !C->HasAnyFlags(RF_Transient) && HasAnySaveGameProps(C))
+					Savable.Add(C);
+
+			Savable.Sort([](const UActorComponent& L, const UActorComponent& R)
+				{
+					return L.GetName() < R.GetName();
+				});
+
+			Rec.Comps.Reset();
+			Rec.Comps.Reserve(Savable.Num());
+
+			for (UActorComponent* C : Savable)
+			{
+				FCompRecord CR;
+				CR.Name = C->GetFName().ToString();
+				CR.ClassPath = C->GetClass()->GetPathName();
+				CR.bDynamic = IsDynamicSavableComponent(C);
+
+				{
+					FMemoryWriter CW(CR.Bytes, true);
+					FOsirisObjAr CAr(CW);
+					C->Serialize(CAr);
+				}
+
+				Rec.Comps.Add(MoveTemp(CR));
+			}
+
+			ActorDB.Add(Rec.Guid, MoveTemp(Rec));
+			NewGuids.Add(SC->OsirisGuid);
+		}
+
+		NewGuids.Sort([](const FGuid& A, const FGuid& B)
+			{
+				if (A.A != B.A) return A.A < B.A;
+				if (A.B != B.B) return A.B < B.B;
+				if (A.C != B.C) return A.C < B.C;
+				return A.D < B.D;
+			});
+
+		if (NewGuids.Num() > 0)
+			ContainerIndex.Add(Canon, MoveTemp(NewGuids));
+	}
+
+	void CaptureAllLoaded(UWorld* World)
+	{
+		if (!World) return;
+		const TArray<ULevel*>& Levels = World->GetLevels();
+		for (ULevel* L : Levels)
+			if (L) CaptureLevel(World, L);
+	}
+
+	bool IsContainerApplied(UWorld* World, ULevel* Level) const
+	{
+		TArray<FName> Aliases;
+		GetContainerAliases(World, Level, Aliases);
+		for (const FName& Id : Aliases)
+			if (AppliedContainersDuringLoad.Contains(Id))
+				return true;
+		return false;
+	}
+
+	void MarkContainerApplied(UWorld* World, ULevel* Level)
+	{
+		TArray<FName> Aliases;
+		GetContainerAliases(World, Level, Aliases);
+		for (const FName& Id : Aliases)
+			AppliedContainersDuringLoad.Add(Id);
+	}
+
+	const TArray<FGuid>* FindGuidsByContainerAliases(UWorld* World, ULevel* Level, FName& OutUsedKey) const
+	{
+		TArray<FName> Aliases;
+		GetContainerAliases(World, Level, Aliases);
+
+		for (const FName& Cid : Aliases)
+		{
+			if (const TArray<FGuid>* Found = ContainerIndex.Find(Cid))
+			{
+				OutUsedKey = Cid;
+				return Found;
+			}
+		}
+
+		OutUsedKey = NAME_None;
+		return nullptr;
+	}
+
+	static UOsirisSaveComponent* FindOrCreateSaveComponent(AActor* A)
+	{
+		if (!A) return nullptr;
+		if (UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>())
+			return SC;
+
+		UOsirisSaveComponent* SC = NewObject<UOsirisSaveComponent>(A, UOsirisSaveComponent::StaticClass(), TEXT("OsirisSaveComponent"));
+		if (!SC) return nullptr;
+
+		SC->OnComponentCreated();
+		A->AddInstanceComponent(SC);
+		SC->RegisterComponent();
+		return SC;
+	}
+
+	void EnsureDynamicComponentsForRecord(AActor* A, const FActorRecord& Rec)
+	{
+		if (!A) return;
+		for (const FCompRecord& CR : Rec.Comps)
+			if (CR.bDynamic)
+				EnsureDynamicComponent(A, CR.Name, CR.ClassPath);
+	}
+
+	void ApplyActorAndComponents(AActor* A, const FActorRecord& Rec)
+	{
+		if (!A || !IsValid(A)) return;
+
+		EnsureDynamicComponentsForRecord(A, Rec);
+
+		if (Rec.ActorBytes.Num() > 0)
+		{
+			FMemoryReader RR(Rec.ActorBytes, true);
+			FOsirisObjAr ObjAr(RR);
+			A->Serialize(ObjAr);
 		}
 
 		TArray<UActorComponent*> Comps;
 		A->GetComponents(Comps);
 
-		for (int32 c = 0; c < CCount; ++c)
+		for (const FCompRecord& CR : Rec.Comps)
 		{
-			FString Name;
-			TArray<uint8> CBytes;
-			Ar << Name;
-			Ar << CBytes;
+			if (CR.Name.IsEmpty() || CR.Bytes.Num() == 0) continue;
 
-			const FName Want(*Name);
-			bool bFound = false;
-
-			for (UActorComponent* Cmp : Comps)
+			const FName Want(*CR.Name);
+			for (UActorComponent* C : Comps)
 			{
-				if (Cmp && Cmp->GetFName() == Want)
+				if (C && C->GetFName() == Want)
 				{
-					bFound = true;
-					if (CBytes.Num())
-					{
-						FMemoryReader CR(CBytes, true);
-						FOsirisAr CAr(CR);
-						Cmp->Serialize(CAr);
-					}
+					FMemoryReader R(CR.Bytes, true);
+					FOsirisObjAr CAr(R);
+					C->Serialize(CAr);
 					break;
 				}
 			}
-
-			if (!bFound && bSpawn) bOk = false;
 		}
 
 		A->ReregisterAllComponents();
-		A->SetActorTransform(Xf, false, nullptr, ETeleportType::TeleportPhysics);
+		A->SetActorTransform(Rec.Transform, false, nullptr, ETeleportType::TeleportPhysics);
 
 		if (UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>())
 			SC->GetOsirisPostLoadHook().Broadcast();
 	}
 
-	if (bDestroy && !Forced)
+	void ApplyLevel(UWorld* World, ULevel* Level)
 	{
-		TArray<AActor*> ToDestroy;
+		if (!World || !Level) return;
 
-		for (AActor* A : Level->Actors)
+		TArray<TWeakObjectPtr<AActor>> PreExistingSavables;
+		if (bPendingLoad)
 		{
-			if (!A) continue;
-			if (APawn* P = Cast<APawn>(A); P && P->IsPlayerControlled()) continue;
+			TArray<AActor*> ExistingActors;
+			GatherLevelActors(World, Level, ExistingActors);
 
-			UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>();
-			if (!SC || !SC->OsirisGuid.IsValid()) continue;
+			for (AActor* A : ExistingActors)
+			{
+				if (!A || !IsValid(A)) continue;
+				if (APawn* P = Cast<APawn>(A); P && P->IsPlayerControlled()) continue;
 
-			if (!SavedGuids.Contains(SC->OsirisGuid))
-				ToDestroy.Add(A);
+				UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>();
+				if (!SC || !SC->OsirisGuid.IsValid()) continue;
+
+				PreExistingSavables.Add(A);
+			}
 		}
 
-		for (AActor* A : ToDestroy)
-			if (IsValid(A))
-				A->Destroy();
-	}
+		FName UsedKey = NAME_None;
+		const TArray<FGuid>* GuidsPtr = FindGuidsByContainerAliases(World, Level, UsedKey);
+		if (!GuidsPtr) return;
 
-	return bOk;
-}
+		const TArray<FGuid>& Guids = *GuidsPtr;
 
-static void OsirisClearPending()
-{
-	GOsirisPending = false;
-	GOsirisPendingRootMap = NAME_None;
-	GOsirisPendingWorld.Reset();
-	GOsirisIgnoreStreamingCapture = false;
-}
+		TMap<FGuid, AActor*> Existing;
+		Existing.Reserve(256);
 
-static void OsirisEnsureHandlers()
-{
-	if (!GOsirisPostLoadH.IsValid())
-	{
-		GOsirisPostLoadH = FCoreUObjectDelegates::PostLoadMapWithWorld.AddLambda([](UWorld* W)
+		{
+			TArray<AActor*> ExistingActors;
+			GatherLevelActors(World, Level, ExistingActors);
+
+			for (AActor* A : ExistingActors)
 			{
-				if (!W || !W->IsGameWorld()) return;
+				if (!A || !IsValid(A)) continue;
+				if (APawn* P = Cast<APawn>(A); P && P->IsPlayerControlled()) continue;
 
-				const FName CurRoot = OsirisGetRootMapId(W);
+				if (UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>())
+					if (SC->OsirisGuid.IsValid())
+						Existing.Add(SC->OsirisGuid, A);
+			}
+		}
 
-				if (GOsirisPending)
+		for (const FGuid& G : Guids)
+		{
+			const FActorRecord* Rec = ActorDB.Find(G);
+			if (!Rec) continue;
+
+			if (Existing.FindRef(G))
+				continue;
+
+			UClass* Cls = StaticLoadClass(AActor::StaticClass(), nullptr, *Rec->ClassPath);
+			if (!Cls) continue;
+
+			FActorSpawnParameters P;
+			P.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+			P.OverrideLevel = Level;
+			P.bDeferConstruction = true;
+
+			AActor* A = World->SpawnActor<AActor>(Cls, Rec->Transform, P);
+			if (!A) continue;
+
+			A->FinishSpawning(Rec->Transform);
+
+			UOsirisSaveComponent* SC = FindOrCreateSaveComponent(A);
+			if (SC) SC->SetOsirisGuid(Rec->Guid);
+
+			Existing.Add(G, A);
+		}
+
+		for (const FGuid& G : Guids)
+		{
+			const FActorRecord* Rec = ActorDB.Find(G);
+			if (!Rec) continue;
+
+			AActor* A = Existing.FindRef(G);
+			if (!A) continue;
+
+			ApplyActorAndComponents(A, *Rec);
+		}
+
+		{
+			TSet<FGuid> Keep;
+			Keep.Reserve(Guids.Num());
+			for (const FGuid& K : Guids) Keep.Add(K);
+
+			TArray<AActor*> ToDestroy;
+
+			if (bPendingLoad)
+			{
+				for (const TWeakObjectPtr<AActor>& WeakA : PreExistingSavables)
 				{
-					if (CurRoot == GOsirisPendingRootMap)
-						GOsirisPendingWorld = W;
-					return;
+					AActor* A = WeakA.Get();
+					if (!A || !IsValid(A)) continue;
+					if (ShouldProtectFromDestroy(A)) continue;
+
+					UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>();
+					if (!SC || !SC->OsirisGuid.IsValid()) continue;
+
+					if (!Keep.Contains(SC->OsirisGuid))
+						ToDestroy.Add(A);
 				}
-
-				OsirisEnsureRoot(W);
-			});
-	}
-
-	if (!GOsirisPostWorldInitH.IsValid())
-	{
-		GOsirisPostWorldInitH = FWorldDelegates::OnPostWorldInitialization.AddLambda([](UWorld* W, const UWorld::InitializationValues)
+			}
+			else
 			{
-				OsirisResetForNewSession(W);
-			});
-	}
+				TArray<AActor*> ExistingActors;
+				GatherLevelActors(World, Level, ExistingActors);
 
-	if (!GOsirisTickH.IsValid())
-	{
-		GOsirisTickH = FWorldDelegates::OnWorldTickStart.AddLambda([](UWorld* W, ELevelTick, float)
-			{
-				if (!GOsirisPending || !W || !W->IsGameWorld()) return;
-				if (GOsirisPendingWorld.IsValid() && W != GOsirisPendingWorld.Get()) return;
-				if (OsirisGetRootMapId(W) != GOsirisPendingRootMap) return;
-				if (!OsirisReady(W)) return;
-
-				OsirisEnsureRoot(W);
-
-				if (W->PersistentLevel)
+				for (AActor* A : ExistingActors)
 				{
-					const FName Pid = OsirisGetLevelId(W, W->PersistentLevel);
-					if (const TArray<uint8>* Bytes = GOsirisLevelData.Find(Pid))
-						OsirisApplyToLevel(W, W->PersistentLevel, *Bytes, true, true, nullptr);
+					if (!A || !IsValid(A)) continue;
+					if (APawn* P = Cast<APawn>(A); P && P->IsPlayerControlled()) continue;
+					if (ShouldProtectFromDestroy(A)) continue;
+
+					UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>();
+					if (!SC || !SC->OsirisGuid.IsValid()) continue;
+
+					if (!Keep.Contains(SC->OsirisGuid))
+						ToDestroy.Add(A);
 				}
+			}
 
-				for (ULevelStreaming* SL : W->GetStreamingLevels())
-				{
-					if (!SL || !SL->IsLevelLoaded() || !SL->IsLevelVisible()) continue;
-					ULevel* Lvl = SL->GetLoadedLevel();
-					if (!Lvl) continue;
-
-					const FName Lid = OsirisGetLevelId(W, Lvl);
-					if (const TArray<uint8>* Bytes = GOsirisLevelData.Find(Lid))
-						OsirisApplyToLevel(W, Lvl, *Bytes, true, true, nullptr);
-				}
-
-				if (GOsirisPlayerData.Num())
-				{
-					APlayerController* PC = UGameplayStatics::GetPlayerController(W, 0);
-					APawn* Pawn = PC ? PC->GetPawn() : nullptr;
-					if (Pawn)
-					{
-						ULevel* Lvl = Pawn->GetLevel() ? Pawn->GetLevel() : W->PersistentLevel;
-						if (Lvl) OsirisApplyToLevel(W, Lvl, GOsirisPlayerData, false, false, Pawn);
-					}
-				}
-
-				OsirisClearPending();
-			});
+			for (AActor* A : ToDestroy)
+				if (IsValid(A)) A->Destroy();
+		}
 	}
 
-	if (!GOsirisLevelAddedH.IsValid())
+	static void WriteActorDB(const TMap<FGuid, FActorRecord>& InDB, TArray<uint8>& Out)
 	{
-		GOsirisLevelAddedH = FWorldDelegates::LevelAddedToWorld.AddLambda([](ULevel* Level, UWorld* World)
+		Out.Reset();
+		FMemoryWriter W(Out, true);
+		FArchive& Ar = W;
+
+		int32 Version = GOsiris_DB_Version;
+		int32 Count = InDB.Num();
+
+		Ar << Version;
+		Ar << Count;
+
+		TArray<FGuid> Keys;
+		Keys.Reserve(Count);
+		for (const auto& Kvp : InDB) Keys.Add(Kvp.Key);
+
+		Keys.Sort([](const FGuid& A, const FGuid& B)
 			{
-				if (!World || !World->IsGameWorld() || !World->HasBegunPlay()) return;
-				if (!Level) return;
-				if (GOsirisPending) return;
-
-				OsirisEnsureRoot(World);
-
-				if (Level == World->PersistentLevel) return;
-				if (!OsirisIsStreamingLevelVisible(World, Level)) return;
-
-				const FName Lid = OsirisGetLevelId(World, Level);
-				if (const TArray<uint8>* Bytes = GOsirisLevelData.Find(Lid))
-					OsirisApplyToLevel(World, Level, *Bytes, true, true, nullptr);
+				if (A.A != B.A) return A.A < B.A;
+				if (A.B != B.B) return A.B < B.B;
+				if (A.C != B.C) return A.C < B.C;
+				return A.D < B.D;
 			});
+
+		for (const FGuid& K : Keys)
+		{
+			const FActorRecord& R = InDB.FindChecked(K);
+
+			WriteNameStr(Ar, R.ContainerId);
+			WriteGuid(Ar, R.Guid);
+
+			FString ClassPath = R.ClassPath;
+			Ar << ClassPath;
+
+			const FTransform& Xf = R.Transform;
+			FVector Loc = Xf.GetLocation();
+			FQuat Rot = Xf.GetRotation();
+			FVector Scale = Xf.GetScale3D();
+			Ar << Loc; Ar << Rot; Ar << Scale;
+
+			WriteBytes(Ar, R.ActorBytes);
+
+			int32 CCount = R.Comps.Num();
+			Ar << CCount;
+
+			for (const FCompRecord& CR : R.Comps)
+			{
+				FString NameStr = CR.Name;
+				FString CompClassPath = CR.ClassPath;
+				Ar << NameStr;
+				Ar << CompClassPath;
+				WriteBool(Ar, CR.bDynamic);
+				WriteBytes(Ar, CR.Bytes);
+			}
+		}
 	}
 
-	if (!GOsirisLevelRemovedH.IsValid())
+	static bool ReadActorDB(const TArray<uint8>& In, TMap<FGuid, FActorRecord>& OutDB)
 	{
-		GOsirisLevelRemovedH = FWorldDelegates::LevelRemovedFromWorld.AddLambda([](ULevel* Level, UWorld* World)
+		OutDB.Reset();
+		if (In.Num() == 0) return true;
+
+		FMemoryReader R(In, true);
+		FArchive& Ar = R;
+
+		int32 Version = 0;
+		int32 Count = 0;
+
+		Ar << Version;
+		Ar << Count;
+
+		if (Ar.IsError()) return false;
+		if (Version != GOsiris_DB_Version) return false;
+		if (Count < 0 || Count > GMaxActorRecords) return false;
+
+		for (int32 i = 0; i < Count; ++i)
+		{
+			FActorRecord Rec;
+
+			ReadNameStr(Ar, Rec.ContainerId);
+			ReadGuid(Ar, Rec.Guid);
+
+			Ar << Rec.ClassPath;
+
+			FVector Loc; FQuat Rot; FVector Scale;
+			Ar << Loc; Ar << Rot; Ar << Scale;
+			Rec.Transform = FTransform(Rot, Loc, Scale);
+
+			if (!ReadBytes(Ar, Rec.ActorBytes, GMaxBytes_Actor))
+				return false;
+
+			int32 CCount = 0;
+			Ar << CCount;
+			if (Ar.IsError()) return false;
+			if (CCount < 0 || CCount > GMaxCompPerActor) return false;
+
+			Rec.Comps.Reset();
+			Rec.Comps.Reserve(CCount);
+
+			for (int32 c = 0; c < CCount; ++c)
 			{
-				if (!World || !World->IsGameWorld() || !World->HasBegunPlay()) return;
-				if (!Level) return;
-				if (GOsirisPending || GOsirisIgnoreStreamingCapture) return;
-				if (Level == World->PersistentLevel) return;
+				FCompRecord CR;
+				Ar << CR.Name;
+				Ar << CR.ClassPath;
+				if (!ReadBool(Ar, CR.bDynamic)) return false;
+				if (!ReadBytes(Ar, CR.Bytes, GMaxBytes_Comp)) return false;
+				Rec.Comps.Add(MoveTemp(CR));
+			}
 
-				OsirisEnsureRoot(World);
+			if (Ar.IsError()) return false;
 
-				TArray<uint8> Bytes;
-				if (OsirisCaptureLevel(World, Level, Bytes))
-					GOsirisLevelData.FindOrAdd(OsirisGetLevelId(World, Level)) = MoveTemp(Bytes);
-			});
+			if (Rec.Guid.IsValid())
+				OutDB.Add(Rec.Guid, MoveTemp(Rec));
+		}
+
+		return !Ar.IsError();
 	}
-}
 
-struct FOsirisAutoInit
-{
-	FOsirisAutoInit() { OsirisEnsureHandlers(); }
+	void OnPostLoadMap(UWorld* World)
+	{
+		if (!World || !World->IsGameWorld()) return;
+
+		if (!SessionWorld.IsValid() || SessionWorld.Get() != World)
+		{
+			if (!bPendingLoad) ResetSession(World);
+			else SessionWorld = World;
+		}
+
+		RootMapId = GetRootMapIdCanonical(World);
+	}
+
+	void OnWorldTickStart(UWorld* World, ELevelTick, float)
+	{
+		if (!bPendingLoad) return;
+		if (!World || !World->IsGameWorld()) return;
+
+		if (!DoesWorldMatchPendingRoot(World, PendingRootMap)) return;
+		if (!IsWorldReady(World)) return;
+
+		bool bAppliedAnyLevelThisTick = false;
+
+		if (!bPlayerEarlyApplied)
+		{
+			ApplyPlayerEarlyTransform(World);
+			bPlayerEarlyApplied = true;
+		}
+
+		const TArray<ULevel*>& Levels = World->GetLevels();
+		for (ULevel* L : Levels)
+		{
+			if (!L) continue;
+
+			if (!IsContainerApplied(World, L))
+			{
+				FName UsedKey = NAME_None;
+				const TArray<FGuid>* GuidsPtr = FindGuidsByContainerAliases(World, L, UsedKey);
+				if (GuidsPtr) ApplyLevel(World, L);
+
+				MarkContainerApplied(World, L);
+				bAppliedAnyLevelThisTick = true;
+			}
+		}
+
+		if (!bPlayerFullApplied)
+		{
+			ApplyPlayerFull(World);
+			bPlayerFullApplied = true;
+		}
+
+		if (bAppliedAnyLevelThisTick) QuietTicks = 0;
+		else ++QuietTicks;
+
+		if (QuietTicks >= GQuietTicksToFinish)
+		{
+			bPendingLoad = false;
+			bIgnoreCapture = false;
+			PendingRootMap = NAME_None;
+			QuietTicks = 0;
+			AppliedContainersDuringLoad.Reset();
+		}
+	}
+
+	void OnLevelAdded(ULevel* Level, UWorld* World)
+	{
+		if (!World || !World->IsGameWorld() || !World->HasBegunPlay()) return;
+		if (!Level) return;
+
+		if (bPendingLoad)
+		{
+			if (!DoesWorldMatchPendingRoot(World, PendingRootMap)) return;
+			if (!IsWorldReady(World)) return;
+
+			if (!IsContainerApplied(World, Level))
+			{
+				FName UsedKey = NAME_None;
+				const TArray<FGuid>* GuidsPtr = FindGuidsByContainerAliases(World, Level, UsedKey);
+				if (GuidsPtr) ApplyLevel(World, Level);
+
+				MarkContainerApplied(World, Level);
+			}
+
+			QuietTicks = 0;
+			return;
+		}
+
+		ApplyLevel(World, Level);
+	}
+
+	void OnLevelRemoved(ULevel* Level, UWorld* World)
+	{
+		if (!World || !World->IsGameWorld() || !World->HasBegunPlay()) return;
+		if (!Level) return;
+		if (bIgnoreCapture) return;
+
+		CaptureLevel(World, Level);
+	}
+
+	bool SaveGame(UOsirisSubsystem* Owner)
+	{
+		if (!Owner) return false;
+
+		UWorld* World = Owner->GetWorld();
+		if (!World || !World->IsGameWorld()) return false;
+
+		RootMapId = GetRootMapIdCanonical(World);
+
+		CaptureAllLoaded(World);
+		CapturePlayer(World);
+
+		UOsirisSaveGame* SG = Cast<UOsirisSaveGame>(UGameplayStatics::CreateSaveGameObject(UOsirisSaveGame::StaticClass()));
+		if (!SG) return false;
+
+		SG->RootMapId = RootMapId;
+		SG->DataContainers.Reset();
+
+		{
+			FOsirisDataContainer C;
+			C.LevelId = GId_ActorDB;
+			WriteActorDB(ActorDB, C.Data);
+			SG->DataContainers.Add(MoveTemp(C));
+		}
+
+		{
+			FOsirisDataContainer C;
+			C.LevelId = GId_Player;
+			C.Data = PlayerBlob;
+			SG->DataContainers.Add(MoveTemp(C));
+		}
+
+		return UGameplayStatics::SaveGameToSlot(SG, GOsirisSlot, 0);
+	}
+
+	bool LoadGame(UOsirisSubsystem* Owner)
+	{
+		if (!Owner) return false;
+
+		UWorld* World = Owner->GetWorld();
+		if (!World || !World->IsGameWorld()) return false;
+
+		UOsirisSaveGame* SG = Cast<UOsirisSaveGame>(UGameplayStatics::LoadGameFromSlot(GOsirisSlot, 0));
+		if (!SG || SG->RootMapId.IsNone()) return false;
+
+		ActorDB.Reset();
+		ContainerIndex.Reset();
+		PlayerBlob.Reset();
+
+		TArray<uint8> ActorDBBlob;
+
+		for (const FOsirisDataContainer& C : SG->DataContainers)
+		{
+			if (C.LevelId == GId_ActorDB) ActorDBBlob = C.Data;
+			else if (C.LevelId == GId_Player) PlayerBlob = C.Data;
+		}
+
+		if (!ReadActorDB(ActorDBBlob, ActorDB)) return false;
+
+		RebuildIndexAll();
+
+		bPendingLoad = true;
+		bIgnoreCapture = true;
+
+		PendingRootMap = MakeNameFromStringNormalized(SG->RootMapId.ToString());
+
+		QuietTicks = 0;
+		bPlayerEarlyApplied = false;
+		bPlayerFullApplied = false;
+		AppliedContainersDuringLoad.Reset();
+
+		if (!DoesWorldMatchPendingRoot(World, PendingRootMap))
+			UGameplayStatics::OpenLevel(Owner, PendingRootMap);
+
+		return true;
+	}
 };
 
-static FOsirisAutoInit GOsirisAutoInit;
+void UOsirisSubsystem::FImplDeleter::operator()(FImpl* Ptr) const
+{
+	delete Ptr;
+}
+
+void UOsirisSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+	Super::Initialize(Collection);
+	Impl.Reset(new FImpl());
+	Impl->Bind();
+}
+
+void UOsirisSubsystem::Deinitialize()
+{
+	if (Impl)
+	{
+		Impl->Unbind();
+		Impl.Reset();
+	}
+	Super::Deinitialize();
+}
 
 bool UOsirisSubsystem::SaveGame()
 {
-	UWorld* World = GetWorld();
-	if (!World || !World->IsGameWorld()) return false;
-
-	OsirisEnsureHandlers();
-	OsirisEnsureRoot(World);
-
-	if (World->PersistentLevel)
-	{
-		TArray<uint8> Bytes;
-		if (OsirisCaptureLevel(World, World->PersistentLevel, Bytes))
-			GOsirisLevelData.FindOrAdd(OsirisGetLevelId(World, World->PersistentLevel)) = MoveTemp(Bytes);
-	}
-
-	for (ULevelStreaming* SL : World->GetStreamingLevels())
-	{
-		if (!SL || !SL->IsLevelLoaded() || !SL->IsLevelVisible()) continue;
-		ULevel* Lvl = SL->GetLoadedLevel();
-		if (!Lvl) continue;
-
-		TArray<uint8> Bytes;
-		if (OsirisCaptureLevel(World, Lvl, Bytes))
-			GOsirisLevelData.FindOrAdd(OsirisGetLevelId(World, Lvl)) = MoveTemp(Bytes);
-	}
-
-	{
-		TArray<uint8> PBytes;
-		if (OsirisCapturePlayer(World, PBytes))
-			GOsirisPlayerData = MoveTemp(PBytes);
-	}
-
-	UOsirisSaveGame* SG = Cast<UOsirisSaveGame>(UGameplayStatics::CreateSaveGameObject(UOsirisSaveGame::StaticClass()));
-	if (!SG) return false;
-
-	SG->RootMapId = OsirisGetRootMapId(World);
-	SG->DataContainers.Reset(GOsirisLevelData.Num() + 1);
-
-	TArray<FName> Keys;
-	Keys.Reserve(GOsirisLevelData.Num());
-	for (const TPair<FName, TArray<uint8>>& Kvp : GOsirisLevelData) Keys.Add(Kvp.Key);
-	Keys.Sort([](const FName& A, const FName& B) { return A.ToString() < B.ToString(); });
-
-	for (const FName& K : Keys)
-	{
-		FOsirisDataContainer C;
-		C.LevelId = K;
-		C.Data = GOsirisLevelData.FindChecked(K);
-		SG->DataContainers.Add(MoveTemp(C));
-	}
-
-	{
-		FOsirisDataContainer P;
-		P.LevelId = GOsirisPlayerId;
-		P.Data = GOsirisPlayerData;
-		SG->DataContainers.Add(MoveTemp(P));
-	}
-
-	return UGameplayStatics::SaveGameToSlot(SG, GOsirisSlot, 0);
+	return Impl ? Impl->SaveGame(this) : false;
 }
 
 bool UOsirisSubsystem::LoadGame()
 {
-	UWorld* World = GetWorld();
-	if (!World || !World->IsGameWorld()) return false;
-
-	OsirisEnsureHandlers();
-
-	UOsirisSaveGame* SG = Cast<UOsirisSaveGame>(UGameplayStatics::LoadGameFromSlot(GOsirisSlot, 0));
-	if (!SG || SG->RootMapId.IsNone()) return false;
-
-	GOsirisRootMapId = SG->RootMapId;
-
-	GOsirisLevelData.Reset();
-	GOsirisPlayerData.Reset();
-
-	for (const FOsirisDataContainer& C : SG->DataContainers)
-	{
-		if (C.LevelId == GOsirisPlayerId)
-		{
-			GOsirisPlayerData = C.Data;
-		}
-		else if (!C.LevelId.IsNone())
-		{
-			GOsirisLevelData.FindOrAdd(C.LevelId) = C.Data;
-		}
-	}
-
-	GOsirisPending = true;
-	GOsirisIgnoreStreamingCapture = true;
-	GOsirisPendingRootMap = SG->RootMapId;
-	GOsirisPendingWorld = (OsirisGetRootMapId(World) == GOsirisPendingRootMap) ? World : nullptr;
-
-	if (OsirisGetRootMapId(World) != GOsirisPendingRootMap)
-	{
-		UGameplayStatics::OpenLevel(this, GOsirisPendingRootMap);
-		return true;
-	}
-
-	if (OsirisReady(World))
-	{
-		bool bOk = true;
-
-		OsirisEnsureRoot(World);
-
-		if (World->PersistentLevel)
-		{
-			const FName Pid = OsirisGetLevelId(World, World->PersistentLevel);
-			if (const TArray<uint8>* Bytes = GOsirisLevelData.Find(Pid))
-				bOk = OsirisApplyToLevel(World, World->PersistentLevel, *Bytes, true, true, nullptr) && bOk;
-		}
-
-		for (ULevelStreaming* SL : World->GetStreamingLevels())
-		{
-			if (!SL || !SL->IsLevelLoaded() || !SL->IsLevelVisible()) continue;
-			ULevel* Lvl = SL->GetLoadedLevel();
-			if (!Lvl) continue;
-
-			const FName Lid = OsirisGetLevelId(World, Lvl);
-			if (const TArray<uint8>* Bytes = GOsirisLevelData.Find(Lid))
-				bOk = OsirisApplyToLevel(World, Lvl, *Bytes, true, true, nullptr) && bOk;
-		}
-
-		if (GOsirisPlayerData.Num())
-		{
-			APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0);
-			APawn* Pawn = PC ? PC->GetPawn() : nullptr;
-			if (Pawn)
-			{
-				ULevel* Lvl = Pawn->GetLevel() ? Pawn->GetLevel() : World->PersistentLevel;
-				if (Lvl) bOk = OsirisApplyToLevel(World, Lvl, GOsirisPlayerData, false, false, Pawn) && bOk;
-			}
-		}
-
-		OsirisClearPending();
-		return bOk;
-	}
-
-	return true;
+	return Impl ? Impl->LoadGame(this) : false;
 }
