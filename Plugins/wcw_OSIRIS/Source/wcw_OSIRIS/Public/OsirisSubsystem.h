@@ -15,8 +15,11 @@ public:
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
 
-	UFUNCTION(BlueprintCallable, Category = "OSIRIS") bool SaveGame();
-	UFUNCTION(BlueprintCallable, Category = "OSIRIS") bool LoadGame();
+	UFUNCTION(BlueprintCallable, Category = "OSIRIS")
+	bool SaveGame(const FString& ProfileName, const FString& SlotName);
+
+	UFUNCTION(BlueprintCallable, Category = "OSIRIS")
+	bool LoadGame(const FString& ProfileName, const FString& SlotName);
 
 private:
 	struct FImpl;

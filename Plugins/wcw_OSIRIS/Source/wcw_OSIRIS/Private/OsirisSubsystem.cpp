@@ -1,4 +1,6 @@
-//� Developer Nikita Petrachkov in collaboration with WINTER CROWN WORKS, all rights reserved �
+﻿//© Developer Nikita Petrachkov in collaboration with WINTER CROWN WORKS, all rights reserved ©
+
+#pragma once
 
 #include "OsirisSubsystem.h"
 
@@ -16,20 +18,25 @@
 #include "UObject/UnrealType.h"
 #include "UObject/UObjectGlobals.h"
 #include "Misc/PackageName.h"
+#include "Misc/Crc.h"
 
 #include "Components/SceneComponent.h"
 
 #include "Serialization/MemoryWriter.h"
 #include "Serialization/MemoryReader.h"
 #include "Serialization/ObjectAndNameAsStringProxyArchive.h"
+#include "Engine/StreamableManager.h"
+#include "Engine/AssetManager.h"
 
-static const FString GOsirisSlot = TEXT("OSIRIS_SLOT");
-static const FName   GId_ActorDB = TEXT("OSIRIS_ACTOR_DB");
-static const FName   GId_Player = TEXT("OSIRIS_PLAYER");
+static const FName GId_ActorDB = TEXT("OSIRIS_ACTOR_DB");
+static const FName GId_Player = TEXT("OSIRIS_PLAYER");
 
-static const FName   GTag_OsirisKeep = TEXT("OsirisKeep");
-static const FName   GTag_OSIRIS_KEEP = TEXT("OSIRIS_KEEP");
-static const FName   GTag_OsirisNoDestroy = TEXT("OsirisNoDestroy");
+static const FName GTag_OsirisKeep = TEXT("OsirisKeep");
+static const FName GTag_OSIRIS_KEEP = TEXT("OSIRIS_KEEP");
+static const FName GTag_OsirisNoDestroy = TEXT("OsirisNoDestroy");
+
+static const FString GOsirisDefaultProfile = TEXT("OSIRIS");
+static const FString GOsirisDefaultSlot = TEXT("OSIRIS");
 
 static constexpr int32  GOsiris_DB_Version = 2;
 static constexpr int32  GMaxActorRecords = 500000;
@@ -37,10 +44,59 @@ static constexpr int32  GMaxCompPerActor = 4096;
 static constexpr int32  GMaxBytes_Actor = 32 * 1024 * 1024;
 static constexpr int32  GMaxBytes_Comp = 16 * 1024 * 1024;
 static constexpr int32  GMaxBytes_PlayerBlob = 64 * 1024 * 1024;
-static constexpr int32  GQuietTicksToFinish = 60;
+
+static constexpr double GQuietSeconds = 1.0;
+static constexpr double GLoadDeadlineSeconds = 30.0;
 
 static constexpr uint32 GPlayerMagic = 0x4F535056;
 static constexpr int32  GPlayerVersion = 2;
+
+static FString NormalizeOrDefault(const FString& In, const FString& DefaultValue)
+{
+	FString S = In;
+	S.TrimStartAndEndInline();
+	return S.IsEmpty() ? DefaultValue : S;
+}
+
+static FString MakeToken(const FString& In, TCHAR Prefix)
+{
+	FString S = In;
+	S.TrimStartAndEndInline();
+	if (S.IsEmpty())
+		S = TEXT("OSIRIS");
+
+	bool bAllSafe = true;
+	FString Out;
+	Out.Reserve(S.Len());
+
+	for (TCHAR Ch : S)
+	{
+		const bool bSafe =
+			(Ch >= TEXT('0') && Ch <= TEXT('9')) ||
+			(Ch >= TEXT('A') && Ch <= TEXT('Z')) ||
+			(Ch >= TEXT('a') && Ch <= TEXT('z')) ||
+			(Ch == TEXT('_'));
+
+		if (bSafe) Out.AppendChar(Ch);
+		else        bAllSafe = false;
+	}
+
+	if (bAllSafe && !Out.IsEmpty())
+	{
+		if (Out.Len() > 32) Out.LeftInline(32);
+		return Out;
+	}
+
+	const uint32 H = FCrc::StrCrc32(*S);
+	return FString::Printf(TEXT("%c%08X"), Prefix, H);
+}
+
+static FString MakeOsirisSlotName_Internal(const FString& ProfileName, const FString& SlotName)
+{
+	const FString P = MakeToken(ProfileName, TEXT('P'));
+	const FString S = MakeToken(SlotName, TEXT('S'));
+	return FString::Printf(TEXT("OSIRIS_%s_%s"), *P, *S);
+}
 
 struct FOsirisObjAr : FObjectAndNameAsStringProxyArchive
 {
@@ -115,6 +171,22 @@ static bool ReadBytes(FArchive& Ar, TArray<uint8>& Out, int32 MaxAllowed)
 	return !Ar.IsError();
 }
 
+static bool IsDynamicSavableComponent(const UActorComponent* C)
+{
+	if (!C) return false;
+	if (C->IsDefaultSubobject()) return false;
+
+	const AActor* Owner = C->GetOwner();
+	if (Owner)
+	{
+		const TArray<UActorComponent*>& IC = Owner->GetInstanceComponents();
+		if (IC.Contains(C)) return true;
+	}
+
+	return (C->CreationMethod == EComponentCreationMethod::Instance) ||
+		(C->CreationMethod == EComponentCreationMethod::UserConstructionScript);
+}
+
 static bool HasAnySaveGameProps(const UObject* Obj)
 {
 	if (!Obj) return false;
@@ -122,6 +194,13 @@ static bool HasAnySaveGameProps(const UObject* Obj)
 		if (It->HasAnyPropertyFlags(CPF_SaveGame))
 			return true;
 	return false;
+}
+
+static bool ShouldSaveComponent(const UActorComponent* C)
+{
+	if (!C)                          return false;
+	if (C->HasAnyFlags(RF_Transient)) return false;
+	return HasAnySaveGameProps(C) || IsDynamicSavableComponent(C);
 }
 
 static bool IsWorldReady(UWorld* World)
@@ -310,38 +389,49 @@ static void GatherLevelActors(UWorld* World, ULevel* Level, TArray<AActor*>& Out
 		OutActors.Add(A);
 }
 
+static FName MakeLevelNameForOpenLevel(const FName& PendingRootMap)
+{
+	if (PendingRootMap.IsNone()) return NAME_None;
+
+	const FString Full = PendingRootMap.ToString();
+	const FString Short = FPackageName::GetShortName(Full);
+
+	return FName(*Short);
+}
+
 struct UOsirisSubsystem::FImpl
 {
 	struct FCompRecord
 	{
 		FString Name;
 		FString ClassPath;
-		bool bDynamic = false;
+		bool    bDynamic = false;
 		TArray<uint8> Bytes;
 	};
 
 	struct FActorRecord
 	{
-		FName ContainerId = NAME_None;
-		FGuid Guid;
-		FString ClassPath;
-		FTransform Transform;
-		TArray<uint8> ActorBytes;
+		FName           ContainerId = NAME_None;
+		FGuid           Guid;
+		FString         ClassPath;
+		FTransform      Transform;
+		TArray<uint8>   ActorBytes;
 		TArray<FCompRecord> Comps;
 	};
 
 	FName RootMapId = NAME_None;
 
-	TMap<FGuid, FActorRecord> ActorDB;
-	TMap<FName, TArray<FGuid>> ContainerIndex;
+	TMap<FGuid, FActorRecord>     ActorDB;
+	TMap<FName, TArray<FGuid>>    ContainerIndex;
 
 	TArray<uint8> PlayerBlob;
 
-	bool bPendingLoad = false;
-	bool bIgnoreCapture = false;
+	bool  bPendingLoad = false;
+	bool  bIgnoreCapture = false;
 	FName PendingRootMap = NAME_None;
 
-	int32 QuietTicks = 0;
+	double QuietSince = -1.0;
+	double LoadStartTime = 0.0;
 
 	bool bPlayerEarlyApplied = false;
 	bool bPlayerFullApplied = false;
@@ -349,6 +439,8 @@ struct UOsirisSubsystem::FImpl
 	TSet<FName> AppliedContainersDuringLoad;
 
 	TWeakObjectPtr<UWorld> SessionWorld;
+
+	TSharedPtr<FStreamableHandle> ClassPreloadHandle;
 
 	FDelegateHandle H_PostLoadMap;
 	FDelegateHandle H_Tick;
@@ -399,9 +491,22 @@ struct UOsirisSubsystem::FImpl
 		bIgnoreCapture = false;
 		PendingRootMap = NAME_None;
 
-		QuietTicks = 0;
+		QuietSince = -1.0;
+		LoadStartTime = 0.0;
 		bPlayerEarlyApplied = false;
 		bPlayerFullApplied = false;
+		AppliedContainersDuringLoad.Reset();
+
+		ClassPreloadHandle.Reset();
+	}
+
+	void FinishPendingLoad()
+	{
+		bPendingLoad = false;
+		bIgnoreCapture = false;
+		PendingRootMap = NAME_None;
+		QuietSince = -1.0;
+		LoadStartTime = 0.0;
 		AppliedContainersDuringLoad.Reset();
 	}
 
@@ -428,20 +533,53 @@ struct UOsirisSubsystem::FImpl
 		}
 	}
 
-	static bool IsDynamicSavableComponent(const UActorComponent* C)
+	void PreloadAllClasses()
 	{
-		if (!C) return false;
-		if (C->IsDefaultSubobject()) return false;
+		ClassPreloadHandle.Reset();
 
-		const AActor* Owner = C->GetOwner();
-		if (Owner)
+		TArray<FSoftObjectPath> Paths;
+		Paths.Reserve(ActorDB.Num() * 2);
+
+		TSet<FString> Seen;
+		Seen.Reserve(ActorDB.Num() * 2);
+
+		for (const TPair<FGuid, FActorRecord>& Kvp : ActorDB)
 		{
-			const TArray<UActorComponent*>& IC = Owner->GetInstanceComponents();
-			if (IC.Contains(C)) return true;
+			const FActorRecord& Rec = Kvp.Value;
+
+			if (!Rec.ClassPath.IsEmpty() && !Seen.Contains(Rec.ClassPath))
+			{
+				Seen.Add(Rec.ClassPath);
+				Paths.Emplace(Rec.ClassPath);
+			}
+
+			for (const FCompRecord& CR : Rec.Comps)
+			{
+				if (CR.bDynamic && !CR.ClassPath.IsEmpty() && !Seen.Contains(CR.ClassPath))
+				{
+					Seen.Add(CR.ClassPath);
+					Paths.Emplace(CR.ClassPath);
+				}
+			}
 		}
 
-		return (C->CreationMethod == EComponentCreationMethod::Instance) ||
-			(C->CreationMethod == EComponentCreationMethod::UserConstructionScript);
+		if (Paths.Num() == 0) return;
+
+		FStreamableManager& SM = UAssetManager::GetStreamableManager();
+		ClassPreloadHandle = SM.RequestAsyncLoad(
+			Paths,
+			FStreamableDelegate(),
+			FStreamableManager::AsyncLoadHighPriority
+		);
+
+		UE_LOG(LogTemp, Log,
+			TEXT("OSIRIS: Async preload started for %d unique class path(s)."),
+			Paths.Num());
+	}
+
+	static bool IsDynamicSavableComponent(const UActorComponent* C)
+	{
+		return ::IsDynamicSavableComponent(C);
 	}
 
 	static UActorComponent* EnsureDynamicComponent(AActor* A, const FString& NameStr, const FString& ClassPath)
@@ -496,20 +634,20 @@ struct UOsirisSubsystem::FImpl
 		SC->GetOsirisPreSaveHook().Broadcast();
 
 		const FGuid Guid = SC->OsirisGuid;
-		FString ClassPath = Pawn->GetClass()->GetPathName();
+		FString     ClassPath = Pawn->GetClass()->GetPathName();
 		const FTransform Xf = Pawn->GetActorTransform();
 
 		TArray<uint8> ActorBytes;
 		{
-			FMemoryWriter AW(ActorBytes, true);
-			FOsirisObjAr AAr(AW);
+			FMemoryWriter  AW(ActorBytes, true);
+			FOsirisObjAr   AAr(AW);
 			Pawn->Serialize(AAr);
 		}
 
 		TArray<UActorComponent*> All; Pawn->GetComponents(All);
 		TArray<UActorComponent*> Savable;
 		for (UActorComponent* C : All)
-			if (C && !C->HasAnyFlags(RF_Transient) && (HasAnySaveGameProps(C) || IsDynamicSavableComponent(C)))
+			if (ShouldSaveComponent(C))
 				Savable.Add(C);
 
 		Savable.Sort([](const UActorComponent& L, const UActorComponent& R)
@@ -522,7 +660,7 @@ struct UOsirisSubsystem::FImpl
 
 		{
 			uint32 Magic = GPlayerMagic;
-			int32 Ver = GPlayerVersion;
+			int32  Ver = GPlayerVersion;
 			Ar << Magic;
 			Ar << Ver;
 		}
@@ -531,7 +669,7 @@ struct UOsirisSubsystem::FImpl
 		Ar << ClassPath;
 
 		FVector Loc = Xf.GetLocation();
-		FQuat Rot = Xf.GetRotation();
+		FQuat   Rot = Xf.GetRotation();
 		FVector Scale = Xf.GetScale3D();
 		Ar << Loc; Ar << Rot; Ar << Scale;
 
@@ -549,7 +687,7 @@ struct UOsirisSubsystem::FImpl
 			TArray<uint8> B;
 			{
 				FMemoryWriter CW(B, true);
-				FOsirisObjAr CAr(CW);
+				FOsirisObjAr  CAr(CW);
 				C->Serialize(CAr);
 			}
 
@@ -570,11 +708,11 @@ struct UOsirisSubsystem::FImpl
 		FArchive& Ar = R;
 
 		uint32 Magic = 0;
-		int32 Ver = 0;
+		int32  Ver = 0;
 		Ar << Magic;
 		Ar << Ver;
 
-		if (Ar.IsError()) return false;
+		if (Ar.IsError())        return false;
 		if (Magic != GPlayerMagic) return false;
 		if (Ver != GPlayerVersion) return false;
 
@@ -591,8 +729,7 @@ struct UOsirisSubsystem::FImpl
 		APawn* Pawn = PC ? PC->GetPawn() : nullptr;
 		if (!Pawn) return;
 
-		int32 StartOffset = 0;
-		int32 Ver = 0;
+		int32 StartOffset = 0, Ver = 0;
 		if (!ReadPlayerHeader(PlayerBlob, StartOffset, Ver)) return;
 
 		FMemoryReader R(PlayerBlob, true);
@@ -621,8 +758,7 @@ struct UOsirisSubsystem::FImpl
 		UOsirisSaveComponent* SC = Pawn->FindComponentByClass<UOsirisSaveComponent>();
 		if (!SC) return;
 
-		int32 StartOffset = 0;
-		int32 Ver = 0;
+		int32 StartOffset = 0, Ver = 0;
 		if (!ReadPlayerHeader(PlayerBlob, StartOffset, Ver)) return;
 
 		FMemoryReader R(PlayerBlob, true);
@@ -649,7 +785,7 @@ struct UOsirisSubsystem::FImpl
 		{
 			FString Name;
 			FString ClassPath;
-			bool bDynamic = false;
+			bool    bDynamic = false;
 			TArray<uint8> Bytes;
 		};
 
@@ -673,7 +809,7 @@ struct UOsirisSubsystem::FImpl
 		if (ABytes.Num() > 0)
 		{
 			FMemoryReader AR(ABytes, true);
-			FOsirisObjAr AAr(AR);
+			FOsirisObjAr  AAr(AR);
 			Pawn->Serialize(AAr);
 		}
 
@@ -690,7 +826,7 @@ struct UOsirisSubsystem::FImpl
 				if (C && C->GetFName() == Want)
 				{
 					FMemoryReader CR(T.Bytes, true);
-					FOsirisObjAr CAr(CR);
+					FOsirisObjAr  CAr(CR);
 					C->Serialize(CAr);
 					break;
 				}
@@ -743,17 +879,15 @@ struct UOsirisSubsystem::FImpl
 		APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0);
 		APawn* Pawn = PC ? PC->GetPawn() : nullptr;
 
-		TArray<FGuid> NewGuids;
-
+		TArray<FGuid>  NewGuids;
 		TArray<AActor*> Candidates;
 		GatherLevelActors(World, Level, Candidates);
 
 		for (AActor* A : Candidates)
 		{
-			if (!A) continue;
-			if (!IsValid(A)) continue;
-			if (A == Pawn) continue;
-			if (A->HasAnyFlags(RF_Transient)) continue;
+			if (!A || !IsValid(A))             continue;
+			if (A == Pawn)                      continue;
+			if (A->HasAnyFlags(RF_Transient))   continue;
 
 			UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>();
 			if (!SC) continue;
@@ -771,14 +905,14 @@ struct UOsirisSubsystem::FImpl
 
 			{
 				FMemoryWriter W(Rec.ActorBytes, true);
-				FOsirisObjAr ObjAr(W);
+				FOsirisObjAr  ObjAr(W);
 				A->Serialize(ObjAr);
 			}
 
 			TArray<UActorComponent*> All; A->GetComponents(All);
 			TArray<UActorComponent*> Savable;
 			for (UActorComponent* C : All)
-				if (C && !C->HasAnyFlags(RF_Transient) && HasAnySaveGameProps(C))
+				if (ShouldSaveComponent(C))
 					Savable.Add(C);
 
 			Savable.Sort([](const UActorComponent& L, const UActorComponent& R)
@@ -798,7 +932,7 @@ struct UOsirisSubsystem::FImpl
 
 				{
 					FMemoryWriter CW(CR.Bytes, true);
-					FOsirisObjAr CAr(CW);
+					FOsirisObjAr  CAr(CW);
 					C->Serialize(CAr);
 				}
 
@@ -871,7 +1005,8 @@ struct UOsirisSubsystem::FImpl
 		if (UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>())
 			return SC;
 
-		UOsirisSaveComponent* SC = NewObject<UOsirisSaveComponent>(A, UOsirisSaveComponent::StaticClass(), TEXT("OsirisSaveComponent"));
+		UOsirisSaveComponent* SC = NewObject<UOsirisSaveComponent>(
+			A, UOsirisSaveComponent::StaticClass(), TEXT("OsirisSaveComponent"));
 		if (!SC) return nullptr;
 
 		SC->OnComponentCreated();
@@ -897,7 +1032,7 @@ struct UOsirisSubsystem::FImpl
 		if (Rec.ActorBytes.Num() > 0)
 		{
 			FMemoryReader RR(Rec.ActorBytes, true);
-			FOsirisObjAr ObjAr(RR);
+			FOsirisObjAr  ObjAr(RR);
 			A->Serialize(ObjAr);
 		}
 
@@ -914,7 +1049,7 @@ struct UOsirisSubsystem::FImpl
 				if (C && C->GetFName() == Want)
 				{
 					FMemoryReader R(CR.Bytes, true);
-					FOsirisObjAr CAr(R);
+					FOsirisObjAr  CAr(R);
 					C->Serialize(CAr);
 					break;
 				}
@@ -978,9 +1113,7 @@ struct UOsirisSubsystem::FImpl
 		{
 			const FActorRecord* Rec = ActorDB.Find(G);
 			if (!Rec) continue;
-
-			if (Existing.FindRef(G))
-				continue;
+			if (Existing.FindRef(G)) continue;
 
 			UClass* Cls = StaticLoadClass(AActor::StaticClass(), nullptr, *Rec->ClassPath);
 			if (!Cls) continue;
@@ -1007,7 +1140,7 @@ struct UOsirisSubsystem::FImpl
 			if (!Rec) continue;
 
 			AActor* A = Existing.FindRef(G);
-			if (!A) continue;
+			if (!A)  continue;
 
 			ApplyActorAndComponents(A, *Rec);
 		}
@@ -1024,7 +1157,7 @@ struct UOsirisSubsystem::FImpl
 				for (const TWeakObjectPtr<AActor>& WeakA : PreExistingSavables)
 				{
 					AActor* A = WeakA.Get();
-					if (!A || !IsValid(A)) continue;
+					if (!A || !IsValid(A))         continue;
 					if (ShouldProtectFromDestroy(A)) continue;
 
 					UOsirisSaveComponent* SC = A->FindComponentByClass<UOsirisSaveComponent>();
@@ -1041,7 +1174,7 @@ struct UOsirisSubsystem::FImpl
 
 				for (AActor* A : ExistingActors)
 				{
-					if (!A || !IsValid(A)) continue;
+					if (!A || !IsValid(A))         continue;
 					if (APawn* P = Cast<APawn>(A); P && P->IsPlayerControlled()) continue;
 					if (ShouldProtectFromDestroy(A)) continue;
 
@@ -1093,9 +1226,9 @@ struct UOsirisSubsystem::FImpl
 			Ar << ClassPath;
 
 			const FTransform& Xf = R.Transform;
-			FVector Loc = Xf.GetLocation();
-			FQuat Rot = Xf.GetRotation();
-			FVector Scale = Xf.GetScale3D();
+			FVector           Loc = Xf.GetLocation();
+			FQuat             Rot = Xf.GetRotation();
+			FVector           Scale = Xf.GetScale3D();
 			Ar << Loc; Ar << Rot; Ar << Scale;
 
 			WriteBytes(Ar, R.ActorBytes);
@@ -1123,13 +1256,11 @@ struct UOsirisSubsystem::FImpl
 		FMemoryReader R(In, true);
 		FArchive& Ar = R;
 
-		int32 Version = 0;
-		int32 Count = 0;
-
+		int32 Version = 0, Count = 0;
 		Ar << Version;
 		Ar << Count;
 
-		if (Ar.IsError()) return false;
+		if (Ar.IsError())                  return false;
 		if (Version != GOsiris_DB_Version) return false;
 		if (Count < 0 || Count > GMaxActorRecords) return false;
 
@@ -1146,8 +1277,7 @@ struct UOsirisSubsystem::FImpl
 			Ar << Loc; Ar << Rot; Ar << Scale;
 			Rec.Transform = FTransform(Rot, Loc, Scale);
 
-			if (!ReadBytes(Ar, Rec.ActorBytes, GMaxBytes_Actor))
-				return false;
+			if (!ReadBytes(Ar, Rec.ActorBytes, GMaxBytes_Actor)) return false;
 
 			int32 CCount = 0;
 			Ar << CCount;
@@ -1162,7 +1292,7 @@ struct UOsirisSubsystem::FImpl
 				FCompRecord CR;
 				Ar << CR.Name;
 				Ar << CR.ClassPath;
-				if (!ReadBool(Ar, CR.bDynamic)) return false;
+				if (!ReadBool(Ar, CR.bDynamic))              return false;
 				if (!ReadBytes(Ar, CR.Bytes, GMaxBytes_Comp)) return false;
 				Rec.Comps.Add(MoveTemp(CR));
 			}
@@ -1183,7 +1313,7 @@ struct UOsirisSubsystem::FImpl
 		if (!SessionWorld.IsValid() || SessionWorld.Get() != World)
 		{
 			if (!bPendingLoad) ResetSession(World);
-			else SessionWorld = World;
+			else               SessionWorld = World;
 		}
 
 		RootMapId = GetRootMapIdCanonical(World);
@@ -1193,9 +1323,19 @@ struct UOsirisSubsystem::FImpl
 	{
 		if (!bPendingLoad) return;
 		if (!World || !World->IsGameWorld()) return;
-
 		if (!DoesWorldMatchPendingRoot(World, PendingRootMap)) return;
 		if (!IsWorldReady(World)) return;
+
+		const double Now = FPlatformTime::Seconds();
+
+		if (Now - LoadStartTime > GLoadDeadlineSeconds)
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("OSIRIS: Pending load exceeded deadline (%.1f s). Finishing now."),
+				GLoadDeadlineSeconds);
+			FinishPendingLoad();
+			return;
+		}
 
 		bool bAppliedAnyLevelThisTick = false;
 
@@ -1227,16 +1367,17 @@ struct UOsirisSubsystem::FImpl
 			bPlayerFullApplied = true;
 		}
 
-		if (bAppliedAnyLevelThisTick) QuietTicks = 0;
-		else ++QuietTicks;
-
-		if (QuietTicks >= GQuietTicksToFinish)
+		if (bAppliedAnyLevelThisTick)
 		{
-			bPendingLoad = false;
-			bIgnoreCapture = false;
-			PendingRootMap = NAME_None;
-			QuietTicks = 0;
-			AppliedContainersDuringLoad.Reset();
+			QuietSince = -1.0;
+		}
+		else
+		{
+			if (QuietSince < 0.0)
+				QuietSince = Now;
+
+			if (Now - QuietSince >= GQuietSeconds)
+				FinishPendingLoad();
 		}
 	}
 
@@ -1259,7 +1400,7 @@ struct UOsirisSubsystem::FImpl
 				MarkContainerApplied(World, Level);
 			}
 
-			QuietTicks = 0;
+			QuietSince = -1.0;
 			return;
 		}
 
@@ -1275,9 +1416,20 @@ struct UOsirisSubsystem::FImpl
 		CaptureLevel(World, Level);
 	}
 
-	bool SaveGame(UOsirisSubsystem* Owner)
+	bool SaveGame(UOsirisSubsystem* Owner, const FString& ProfileName, const FString& SlotName)
 	{
 		if (!Owner) return false;
+
+		if (bPendingLoad)
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("OSIRIS SaveGame: Rejected — a load is still in progress. "
+					"Wait for the load to complete before saving."));
+			return false;
+		}
+
+		const FString PName = NormalizeOrDefault(ProfileName, GOsirisDefaultProfile);
+		const FString SName = NormalizeOrDefault(SlotName, GOsirisDefaultSlot);
 
 		UWorld* World = Owner->GetWorld();
 		if (!World || !World->IsGameWorld()) return false;
@@ -1287,9 +1439,13 @@ struct UOsirisSubsystem::FImpl
 		CaptureAllLoaded(World);
 		CapturePlayer(World);
 
-		UOsirisSaveGame* SG = Cast<UOsirisSaveGame>(UGameplayStatics::CreateSaveGameObject(UOsirisSaveGame::StaticClass()));
+		UOsirisSaveGame* SG = Cast<UOsirisSaveGame>(
+			UGameplayStatics::CreateSaveGameObject(UOsirisSaveGame::StaticClass()));
 		if (!SG) return false;
 
+		SG->ProfileName = PName;
+		SG->SlotName = SName;
+		SG->SavedAtUtc = FDateTime::UtcNow();
 		SG->RootMapId = RootMapId;
 		SG->DataContainers.Reset();
 
@@ -1307,47 +1463,73 @@ struct UOsirisSubsystem::FImpl
 			SG->DataContainers.Add(MoveTemp(C));
 		}
 
-		return UGameplayStatics::SaveGameToSlot(SG, GOsirisSlot, 0);
+		const FString FinalSlot = MakeOsirisSlotName_Internal(PName, SName);
+		return UGameplayStatics::SaveGameToSlot(SG, FinalSlot, 0);
 	}
 
-	bool LoadGame(UOsirisSubsystem* Owner)
+	bool LoadGame(UOsirisSubsystem* Owner, const FString& ProfileName, const FString& SlotName)
 	{
 		if (!Owner) return false;
+
+		const FString PName = NormalizeOrDefault(ProfileName, GOsirisDefaultProfile);
+		const FString SName = NormalizeOrDefault(SlotName, GOsirisDefaultSlot);
 
 		UWorld* World = Owner->GetWorld();
 		if (!World || !World->IsGameWorld()) return false;
 
-		UOsirisSaveGame* SG = Cast<UOsirisSaveGame>(UGameplayStatics::LoadGameFromSlot(GOsirisSlot, 0));
-		if (!SG || SG->RootMapId.IsNone()) return false;
+		const FString FinalSlot = MakeOsirisSlotName_Internal(PName, SName);
+
+		UOsirisSaveGame* SG = Cast<UOsirisSaveGame>(
+			UGameplayStatics::LoadGameFromSlot(FinalSlot, 0));
+
+		if (!SG || SG->RootMapId.IsNone())       return false;
+		if (!SG->ProfileName.IsEmpty() && SG->ProfileName != PName) return false;
+		if (!SG->SlotName.IsEmpty() && SG->SlotName != SName) return false;
 
 		ActorDB.Reset();
 		ContainerIndex.Reset();
 		PlayerBlob.Reset();
 
 		TArray<uint8> ActorDBBlob;
-
 		for (const FOsirisDataContainer& C : SG->DataContainers)
 		{
 			if (C.LevelId == GId_ActorDB) ActorDBBlob = C.Data;
-			else if (C.LevelId == GId_Player) PlayerBlob = C.Data;
+			else if (C.LevelId == GId_Player)  PlayerBlob = C.Data;
 		}
 
 		if (!ReadActorDB(ActorDBBlob, ActorDB)) return false;
 
 		RebuildIndexAll();
+		PreloadAllClasses();
 
 		bPendingLoad = true;
 		bIgnoreCapture = true;
 
 		PendingRootMap = MakeNameFromStringNormalized(SG->RootMapId.ToString());
-
-		QuietTicks = 0;
+		QuietSince = -1.0;
+		LoadStartTime = FPlatformTime::Seconds();
 		bPlayerEarlyApplied = false;
 		bPlayerFullApplied = false;
 		AppliedContainersDuringLoad.Reset();
 
 		if (!DoesWorldMatchPendingRoot(World, PendingRootMap))
-			UGameplayStatics::OpenLevel(Owner, PendingRootMap);
+		{
+			const FName LevelName = MakeLevelNameForOpenLevel(PendingRootMap);
+
+			if (!LevelName.IsNone())
+			{
+				UGameplayStatics::OpenLevel(Owner, LevelName);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("OSIRIS LoadGame: Could not derive a valid level name from '%s'. Load aborted."),
+					*PendingRootMap.ToString());
+
+				FinishPendingLoad();
+				return false;
+			}
+		}
 
 		return true;
 	}
@@ -1375,12 +1557,12 @@ void UOsirisSubsystem::Deinitialize()
 	Super::Deinitialize();
 }
 
-bool UOsirisSubsystem::SaveGame()
+bool UOsirisSubsystem::SaveGame(const FString& ProfileName, const FString& SlotName)
 {
-	return Impl ? Impl->SaveGame(this) : false;
+	return Impl ? Impl->SaveGame(this, ProfileName, SlotName) : false;
 }
 
-bool UOsirisSubsystem::LoadGame()
+bool UOsirisSubsystem::LoadGame(const FString& ProfileName, const FString& SlotName)
 {
-	return Impl ? Impl->LoadGame(this) : false;
+	return Impl ? Impl->LoadGame(this, ProfileName, SlotName) : false;
 }

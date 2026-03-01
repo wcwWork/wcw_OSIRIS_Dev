@@ -8,32 +8,34 @@
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOsirisHook);
 
+
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
 class WCW_OSIRIS_API UOsirisSaveComponent : public UActorComponent
 {
 	GENERATED_BODY()
 
 public:
-	UPROPERTY(BlueprintAssignable, Category = "OSIRIS")
-		FOsirisHook OnOsirisPreSave;
 
 	UPROPERTY(BlueprintAssignable, Category = "OSIRIS")
-		FOsirisHook OnOsirisPostLoad;
+	FOsirisHook OnOsirisPreSave;
+
+	UPROPERTY(BlueprintAssignable, Category = "OSIRIS")
+	FOsirisHook OnOsirisPostLoad;
 
 	UFUNCTION(BlueprintCallable, Category = "OSIRIS")
-		void Osiris_BroadcastPreSave();
+	void Osiris_BroadcastPreSave();
 
 	UFUNCTION(BlueprintCallable, Category = "OSIRIS")
-		void Osiris_BroadcastPostLoad();
+	void Osiris_BroadcastPostLoad();
 
 	UPROPERTY(EditInstanceOnly, BlueprintReadOnly, Category = "OSIRIS")
-		FGuid OsirisGuid;
+	FGuid OsirisGuid;
 
 	UFUNCTION(BlueprintCallable, Category = "OSIRIS")
-		FString GetOsirisGuidString() const;
+	FString GetOsirisGuidString() const;
 
-	FORCEINLINE const FOsirisHook& GetOsirisPreSaveHook() const { return OnOsirisPreSave; }
-	FORCEINLINE const FOsirisHook& GetOsirisPostLoadHook() const { return OnOsirisPostLoad; }
+	FORCEINLINE FOsirisHook& GetOsirisPreSaveHook() { return OnOsirisPreSave; }
+	FORCEINLINE FOsirisHook& GetOsirisPostLoadHook() { return OnOsirisPostLoad; }
 
 	void SetOsirisGuid(const FGuid& InGuid) { OsirisGuid = InGuid; }
 
